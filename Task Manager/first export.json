@@ -1,0 +1,25 @@
+{
+  "user": {
+    "id": 3,
+    "username": "mat"
+  },
+  "exported_at": "2025-08-22T13:54:45",
+  "tasks": [
+    {
+      "id": 9,
+      "title": "User progress",
+      "description": "user progress task",
+      "completed": false,
+      "due_date": "2025-08-22",
+      "priority": "high"
+    },
+    {
+      "id": 10,
+      "title": "priority task",
+      "description": "priority task description",
+      "completed": false,
+      "due_date": "2025-08-22",
+      "priority": "medium"
+    }
+  ]
+}

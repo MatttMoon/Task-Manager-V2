@@ -32,8 +32,18 @@
     <Compile Include="ui\task_widget.py" />
   </ItemGroup>
   <ItemGroup>
+    <Folder Include="assets\icons\" />
+    <Folder Include="assets\images\" />
     <Folder Include="db\" />
+    <Folder Include="assets\" />
     <Folder Include="ui\" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include=".gitignore" />
+    <Content Include="assets\icons\task5.ico" />
+    <Content Include="assets\icons\task5.png" />
+    <Content Include="assets\images\task5.png" />
+    <Content Include="assets\images\task5_banner.png" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

@@ -1,0 +1,60 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+*.egg
+*.log
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# === Databases ===
+*.db
+*.sqlite3
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+
+# === IDE / Editors ===
+# VS Code
+.vscode/
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# === Build / Distribution ===
+build/
+dist/
+*.spec
+
+# === Project-specific ===
+# Ignore local settings (user prefs, mic index, etc.)
+app_settings.json
+
+# Keep assets (images/icons), but ignore temp or exports
+assets/export/
+assets/temp/
+
+# If you generate reports/logs
+reports/
+logs/
+
+# === Backup ===
+*.bak
+*.swp
+*.tmp

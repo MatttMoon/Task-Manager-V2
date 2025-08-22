@@ -1,3 +1,58 @@
 {
-  "mic_device_index": 0
+  "mic_device_index": 1,
+  "theme": "dark",
+  "accent": "#9c27b0",
+  "priorities": {
+    "9": "high",
+    "10": "medium",
+    "11": "high",
+    "12": "medium",
+    "14": "low",
+    "19": "medium",
+    "22": "low"
+  },
+  "reminded": {
+    "2025-08-22": [
+      "9",
+      "10",
+      "11",
+      "12",
+      "14",
+      "22"
+    ]
+  },
+  "completion_log": [
+    "2025-08-22"
+  ],
+  "groups": [
+    "Bus121",
+    "csc212"
+  ],
+  "task_groups": {
+    "14": "Bus121",
+    "19": "Bus121"
+  },
+  "users": {
+    "3": {
+      "groups": [
+        "Math",
+        "English"
+      ],
+      "task_groups": {},
+      "priorities": {},
+      "completion_log": [
+        "2025-08-22"
+      ],
+      "reminded": {
+        "2025-08-22": []
+      }
+    },
+    "5": {
+      "groups": [],
+      "task_groups": {},
+      "priorities": {},
+      "completion_log": [],
+      "reminded": {}
+    }
+  }
 }

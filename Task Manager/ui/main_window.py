@@ -1,247 +1,637 @@
-﻿# ui/main_window.py
+﻿# -*- coding: utf-8 -*-
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLabel, QLineEdit, QTextEdit,
-    QListWidget, QMessageBox, QTabWidget, QHBoxLayout, QComboBox, QApplication
+    QListWidget, QMessageBox, QTabWidget, QHBoxLayout, QApplication, QComboBox,
+    QFileDialog, QProgressBar, QCalendarWidget, QSplitter, QDialog, QPlainTextEdit,
+    QGraphicsDropShadowEffect
 )
-from PyQt5.QtCore import Qt, QTimer
-from datetime import datetime, date
+from PyQt5.QtCore import Qt, QTimer, QDate
+from PyQt5.QtGui import QColor, QTextCharFormat
+from datetime import datetime, date, timedelta
 from db import database as db
-import re, json, os, threading
+import re, json, os, sys
 
-# SpeechRecognition is optional; app still runs without it.
-try:
-    import speech_recognition as sr
-    VOICE_OK = True
-except Exception:
-    VOICE_OK = False
-
+# -------------------- Config (global + per-user) --------------------
 CONFIG_FILE = "app_settings.json"
 
+GLOBAL_DEFAULTS = {
+    "theme": "aurora",
+    "accent": "#7AA2F7",
+    "users": {}  # per-user buckets live here
+}
+
+USER_DEFAULTS = {
+    "groups": [],           # ["Computer", "Business", ...]
+    "task_groups": {},      # {task_id: "GroupName"}
+    "priorities": {},       # {task_id: "low|medium|high"}
+    "completion_log": [],   # ["YYYY-MM-DD", ...]
+    "reminded": {}          # {"YYYY-MM-DD": [task_id, ...]}
+}
 
 def _load_cfg():
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
+                data = json.load(f) or {}
+                # backfill missing global keys
+                for k, v in GLOBAL_DEFAULTS.items():
+                    if k == "users":
+                        data.setdefault("users", {})
+                    else:
+                        data.setdefault(k, v)
+                return data
     except Exception:
         pass
-    return {}
-
+    _save_cfg(GLOBAL_DEFAULTS)
+    # deep copy
+    return json.loads(json.dumps(GLOBAL_DEFAULTS))
 
 def _save_cfg(cfg: dict):
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print("Error saving config:", e)
 
+def _user_bucket(cfg: dict, user_id: int) -> dict:
+    """Ensure a per-user bucket exists and is backfilled; return it."""
+    ukey = str(user_id)
+    if "users" not in cfg:
+        cfg["users"] = {}
+    if ukey not in cfg["users"]:
+        cfg["users"][ukey] = json.loads(json.dumps(USER_DEFAULTS))  # deep copy
+        _save_cfg(cfg)
+    else:
+        # backfill after updates
+        for k, v in USER_DEFAULTS.items():
+            cfg["users"][ukey].setdefault(k, json.loads(json.dumps(v)))
+    return cfg["users"][ukey]
 
+# -------------------- Small helpers --------------------
+def _today_iso() -> str:
+    return date.today().isoformat()
+
+# -------------------- Main Window --------------------
 class MainWindow(QWidget):
     def __init__(self, user):
         super().__init__()
         self.user = user  # (id, username, xp)
-        self.setWindowTitle("Task Manager with XP System")
-        self.resize(760, 600)
+        self.setWindowTitle("Task5")
+        self.resize(1000, 700)
 
-        # ---- settings / persistence ----
-        self.cfg = _load_cfg()
-        self.mic_index = self.cfg.get("mic_device_index", None)  # int, or None for system default
+        # settings
+        self.cfg = _load_cfg()                  # global (theme/accent)
+        self.ucfg = _user_bucket(self.cfg, self.user[0])  # per-user bucket
 
-        # ---- speech state (lazy init) ----
-        self._r = None              # sr.Recognizer
-        self._mic = None            # sr.Microphone bound to selected device
-        self._bg_stop = None        # stop handle from listen_in_background
-        self._listen_timer = None   # watchdog QTimer
+        # --- one-time migration from old global keys (if present) ---
+        _legacy = ("groups","task_groups","priorities","completion_log","reminded")
+        migrated = False
+        for k in _legacy:
+            if k in self.cfg and k not in self.ucfg:
+                self.ucfg[k] = self.cfg.pop(k)
+                migrated = True
+        if migrated:
+            _save_cfg(self.cfg)
+        # ------------------------------------------------------------
 
-        # ---- tabs / layout ----
+        # layout
         self.tabs = QTabWidget(self)
         root = QVBoxLayout(self)
         root.addWidget(self.tabs)
-
         self.init_task_tab()
+        self.init_calendar_tab()
         self.init_settings_tab()
 
-        # stop SR threads cleanly when app quits
-        app = QApplication.instance()
-        if app:
-            app.aboutToQuit.connect(self._shutdown_voice)
+        # apply theme after UI exists
+        self.apply_theme(self.cfg.get("theme", "aurora"))
+        self.apply_accent(self.cfg.get("accent", "#7AA2F7"))
+        self._apply_aurora_effects_if_needed()
 
+        # initial data
+        self.refresh_group_controls()
         self.refresh_tasks()
 
-    # =========================
-    # Task tab
-    # =========================
+        # reminders
+        self.reminder_timer = QTimer(self)
+        self.reminder_timer.timeout.connect(self.check_due_reminders)
+        self.reminder_timer.start(60_000)
+        self.check_due_reminders()
+
+    # -------------------- Task tab --------------------
     def init_task_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        # header
+        # Header: Progress + Streak
         hdr = QHBoxLayout()
-        hdr.addWidget(QLabel("User Progress:"))
+        left = QHBoxLayout()
+        left.addWidget(QLabel("User Progress:"))
         self.user_label = QLabel("XP: 0")
         self.level_label = QLabel("Level: 0")
+        self.level_bar = QProgressBar()
+        self.level_bar.setRange(0, 100)
+        self.level_bar.setValue(0)
+        self.level_bar.setFixedWidth(220)
+        self.level_bar.setTextVisible(True)
+        self.level_bar.setFormat("%p%")
+
+        left.addSpacing(12)
+        left.addWidget(self.user_label)
+        left.addSpacing(8)
+        left.addWidget(self.level_label)
+        left.addSpacing(8)
+        left.addWidget(self.level_bar)
+
+        right = QHBoxLayout()
+        self.streak_label = QLabel("🔥 Streak: 0")
+        right.addWidget(self.streak_label)
+
+        hdr.addLayout(left)
         hdr.addStretch(1)
-        hdr.addWidget(self.user_label); hdr.addSpacing(10); hdr.addWidget(self.level_label)
+        hdr.addLayout(right)
         layout.addLayout(hdr)
 
-        # title + mic
+        # Row: Title + Group + Priority
         trow = QHBoxLayout()
         trow.addWidget(QLabel("Task Title:"))
-        self.task_input = QLineEdit()
-        self.task_input.setPlaceholderText("Enter task title")
+        self.task_input = QLineEdit(placeholderText="Enter task title")
         self.task_input.setToolTip("Required. Max 100 characters.")
         trow.addWidget(self.task_input, 1)
 
-        self.title_mic_btn = QPushButton("🎤")
-        self.title_mic_btn.setFixedWidth(36)
-        self.title_mic_btn.setFocusPolicy(Qt.NoFocus)
-        self.title_mic_btn.setToolTip("Click, then speak the task title")
-        self.title_mic_btn.clicked.connect(self.mic_fill_title)
-        trow.addWidget(self.title_mic_btn)
+        trow.addSpacing(8)
+        trow.addWidget(QLabel("Group:"))
+        self.group_combo = QComboBox()
+        self.group_combo.setEditable(True)  # type a new group or pick existing
+        trow.addWidget(self.group_combo)
 
-        self.title_status = QLabel("")
-        self.title_status.setStyleSheet("color:#888;")
-        trow.addWidget(self.title_status)
+        trow.addSpacing(8)
+        trow.addWidget(QLabel("Priority:"))
+        self.priority_combo = QComboBox()
+        self.priority_combo.addItems(["Low", "Medium", "High"])
+        trow.addWidget(self.priority_combo)
         layout.addLayout(trow)
 
-        # description + mic
+        # Description
         drow = QHBoxLayout()
         drow.addWidget(QLabel("Task Description:"))
-        self.task_desc = QTextEdit()
-        self.task_desc.setPlaceholderText("Task description")
-        self.task_desc.setFixedHeight(110)
-        drow.addWidget(self.task_desc, 1)
-
-        self.desc_mic_btn = QPushButton("🎤")
-        self.desc_mic_btn.setFixedWidth(36)
-        self.desc_mic_btn.setFocusPolicy(Qt.NoFocus)
-        self.desc_mic_btn.setToolTip("Click, then speak the task description")
-        self.desc_mic_btn.clicked.connect(self.mic_fill_description)
-        drow.addWidget(self.desc_mic_btn)
-
+        self.task_desc_input = QTextEdit()
+        self.task_desc_input.setPlaceholderText("Task description")
+        self.task_desc_input.setFixedHeight(110)
+        drow.addWidget(self.task_desc_input, 1)
         self.desc_status = QLabel("")
         self.desc_status.setStyleSheet("color:#888;")
         drow.addWidget(self.desc_status)
         layout.addLayout(drow)
 
-        # due date (manual)
+        # Due date
         du = QHBoxLayout()
         du.addWidget(QLabel("Due Date:"))
-        self.due_date_input = QLineEdit()
-        self.due_date_input.setPlaceholderText("YYYY-MM-DD")
+        self.due_date_input = QLineEdit(placeholderText="YYYY-MM-DD")
         du.addWidget(self.due_date_input, 0)
         du.addSpacing(10)
         du.addWidget(QLabel("Format: YYYY-MM-DD"))
         du.addStretch(1)
         layout.addLayout(du)
 
-        # action buttons
+        # Actions
         btns = QHBoxLayout()
         self.add_button = QPushButton("➕ Add Task"); self.add_button.clicked.connect(self.add_task)
+        self.bulk_button = QPushButton("🧺 Bulk Add"); self.bulk_button.clicked.connect(self.bulk_add_tasks)
         self.complete_button = QPushButton("✔️ Mark Complete"); self.complete_button.clicked.connect(self.complete_task)
         self.delete_button = QPushButton("🗑️ Delete Task"); self.delete_button.clicked.connect(self.delete_task)
-        btns.addStretch(1); btns.addWidget(self.add_button); btns.addWidget(self.complete_button); btns.addWidget(self.delete_button)
+        self.export_button = QPushButton("📤 Export"); self.export_button.clicked.connect(self.export_tasks)
+        self.import_button = QPushButton("📥 Import"); self.import_button.clicked.connect(self.import_tasks)
+        for b in (self.add_button, self.bulk_button, self.complete_button,
+                  self.delete_button, self.export_button, self.import_button):
+            b.setProperty("flat", True)
+        btns.addStretch(1)
+        for b in (self.add_button, self.bulk_button, self.complete_button,
+                  self.delete_button, self.export_button, self.import_button):
+            btns.addWidget(b)
         layout.addLayout(btns)
 
-        # list + details
+        # Filters
+        frow = QHBoxLayout()
+        frow.addWidget(QLabel("Search:"))
+        self.search_input = QLineEdit(placeholderText="Type to filter by title/description...")
+        self.search_input.textChanged.connect(self.refresh_tasks)
+        frow.addWidget(self.search_input, 1)
+
+        self.group_filter = QComboBox()
+        self.group_filter.addItem("All Groups")
+        self.group_filter.currentTextChanged.connect(self.refresh_tasks)
+
+        self.status_filter = QComboBox()
+        self.status_filter.addItems(["All", "Not Completed", "Completed", "Due Today"])
+        self.status_filter.currentTextChanged.connect(self.refresh_tasks)
+
+        frow.addSpacing(8)
+        frow.addWidget(QLabel("Group:"))
+        frow.addWidget(self.group_filter)
+        frow.addSpacing(8)
+        frow.addWidget(QLabel("Filter:"))
+        frow.addWidget(self.status_filter)
+        layout.addLayout(frow)
+
+        # List + details
         layout.addWidget(QLabel("Your Tasks:"))
         self.task_list = QListWidget()
         self.task_list.itemSelectionChanged.connect(self.show_description)
+        self.task_list.itemDoubleClicked.connect(lambda _: self.open_details_popup())
         layout.addWidget(self.task_list, 1)
 
-        layout.addWidget(QLabel("Selected Task Details:"))
-        self.task_description_label = QLabel("Select a task to see its description.")
-        self.task_description_label.setWordWrap(True)
-        self.task_description_label.setFixedHeight(94)
-        layout.addWidget(self.task_description_label)
+        # Details header with Pop out
+        hdr_details = QHBoxLayout()
+        hdr_details.addWidget(QLabel("Selected Task Details:"))
+        self.details_pop_btn = QPushButton("Pop out")
+        self.details_pop_btn.clicked.connect(self.open_details_popup)
+        hdr_details.addStretch(1)
+        hdr_details.addWidget(self.details_pop_btn)
+        layout.addLayout(hdr_details)
+
+        # Scrollable details
+        self.task_details = QTextEdit()
+        self.task_details.setReadOnly(True)
+        self.task_details.setPlaceholderText("Select a task to see its description.")
+        self.task_details.setMinimumHeight(110)
+        self.task_details.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        layout.addWidget(self.task_details)
 
         self.tabs.addTab(tab, "Tasks")
 
-    # =========================
-    # Settings tab (Microphone picker)
-    # =========================
+    # -------------------- Calendar tab --------------------
+    def init_calendar_tab(self):
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+
+        top = QHBoxLayout()
+        self.cal_toggle_btn = QPushButton("Hide Calendar")
+        self.cal_toggle_btn.clicked.connect(self.toggle_calendar_panel)
+        self.cal_selected_label = QLabel("Selected: Today")
+        top.addWidget(self.cal_toggle_btn)
+        top.addStretch(1)
+        top.addWidget(self.cal_selected_label)
+        v.addLayout(top)
+
+        self.cal_splitter = QSplitter(Qt.Horizontal)
+        self.calendar = QCalendarWidget()
+        self.calendar.setGridVisible(True)
+        self.calendar.clicked.connect(self.on_calendar_date_changed)
+        self.calendar.selectionChanged.connect(self.on_calendar_selection_changed)
+
+        right_box = QWidget()
+        right_layout = QVBoxLayout(right_box)
+        right_layout.addWidget(QLabel("Tasks on this date:"))
+        self.cal_tasks_list = QListWidget()
+        right_layout.addWidget(self.cal_tasks_list, 1)
+
+        self.cal_splitter.addWidget(self.calendar)
+        self.cal_splitter.addWidget(right_box)
+        self.cal_splitter.setStretchFactor(0, 0)
+        self.cal_splitter.setStretchFactor(1, 1)
+
+        v.addWidget(self.cal_splitter, 1)
+
+        self.tabs.addTab(tab, "Calendar")
+
+    def toggle_calendar_panel(self):
+        if self.calendar.isVisible():
+            self.calendar.setVisible(False)
+            self.cal_toggle_btn.setText("Show Calendar")
+        else:
+            self.calendar.setVisible(True)
+            self.cal_toggle_btn.setText("Hide Calendar")
+
+    def on_calendar_selection_changed(self):
+        self.update_calendar_selected_label()
+        self.populate_calendar_day_list()
+
+    def on_calendar_date_changed(self, qdate: QDate):
+        self.update_calendar_selected_label(qdate)
+        self.populate_calendar_day_list()
+
+    def update_calendar_selected_label(self, qdate: QDate = None):
+        qd = qdate if qdate is not None else self.calendar.selectedDate()
+        py = date(qd.year(), qd.month(), qd.day())
+        if py == date.today():
+            self.cal_selected_label.setText("Selected: Today")
+        else:
+            self.cal_selected_label.setText("Selected: " + py.strftime("%A, %B %d, %Y"))
+
+    def populate_calendar_day_list(self):
+        self.cal_tasks_list.clear()
+        qd = self.calendar.selectedDate()
+        day_iso = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
+
+        tasks_on_day = [t for t in db.get_tasks(self.user[0]) if t[5] == day_iso]
+        if not tasks_on_day:
+            self.cal_tasks_list.addItem("No tasks due.")
+            return
+
+        for t in tasks_on_day:
+            task_id = t[0]
+            title = t[2]
+            completed = bool(t[4])
+            group = self.ucfg["task_groups"].get(str(task_id), "")
+            group_badge = f"[{group}] " if group else ""
+            prio = self.ucfg["priorities"].get(str(task_id), "low")
+            picon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(prio, "🟢")
+            status = "✅" if completed else "❌"
+            self.cal_tasks_list.addItem(f"{status} {picon} [{task_id}] {group_badge}{title}")
+
+    def refresh_calendar_marks(self):
+        self.calendar.setDateTextFormat(QDate(), QTextCharFormat())
+        marks = {}
+        for task in db.get_tasks(self.user[0]):
+            d = task[5]
+            if not d:
+                continue
+            try:
+                dt = datetime.strptime(d, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            qd = QDate(dt.year, dt.month, dt.day)
+            any_incomplete = not bool(task[4])
+            prev = marks.get(qd, (False, False))
+            marks[qd] = (True, prev[1] or any_incomplete)
+
+        for qd, (_any, has_incomplete) in marks.items():
+            fmt = QTextCharFormat()
+            fmt.setFontWeight(75)
+            fmt.setForeground(QColor(self.cfg.get("accent", "#7AA2F7") if has_incomplete else "#7aa2f7"))
+            self.calendar.setDateTextFormat(qd, fmt)
+
+        self.populate_calendar_day_list()
+        self.update_calendar_selected_label()
+
+    # -------------------- Settings tab --------------------
     def init_settings_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.addWidget(QLabel("⚙️ Settings"))
 
-        # mic picker row
-        mic_row = QHBoxLayout()
-        mic_row.addWidget(QLabel("Microphone:"))
-        self.mic_combo = QComboBox()
-        self.mic_refresh_btn = QPushButton("Refresh")
-        self.mic_save_btn = QPushButton("Save")
-        self.mic_refresh_btn.clicked.connect(self.populate_mic_combo)
-        self.mic_save_btn.clicked.connect(self.save_mic_selection)
-        mic_row.addWidget(self.mic_combo, 1)
-        mic_row.addWidget(self.mic_refresh_btn)
-        mic_row.addWidget(self.mic_save_btn)
-        layout.addLayout(mic_row)
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("Theme:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Light", "Dark", "Aurora"])
+        current_theme = self.cfg.get("theme", "aurora").lower()
+        self.theme_combo.setCurrentIndex(0 if current_theme == "light" else 1 if current_theme == "dark" else 2)
+        self.theme_combo.currentTextChanged.connect(self.on_theme_changed)
+        theme_row.addWidget(self.theme_combo)
 
-        # reset/clear
+        theme_row.addSpacing(16)
+        theme_row.addWidget(QLabel("Accent:"))
+        self.accent_combo = QComboBox()
+        presets = ["#7AA2F7", "#4caf50", "#ff9800", "#e91e63", "#9c27b0", "Custom…"]
+        self.accent_combo.addItems(presets)
+        current_accent = self.cfg.get("accent", "#7AA2F7")
+        try:
+            idx = presets.index(current_accent)
+        except ValueError:
+            idx = len(presets) - 1
+        self.accent_combo.setCurrentIndex(idx)
+        self.accent_combo.currentTextChanged.connect(self.on_accent_changed)
+        theme_row.addWidget(self.accent_combo)
+
+        theme_row.addStretch(1)
+        layout.addLayout(theme_row)
+
+        ginfo = QLabel("Groups help you organize tasks by class or project. "
+                       "Create/select one when adding tasks, or use Bulk Add.")
+        ginfo.setWordWrap(True)
+        layout.addWidget(ginfo)
+
         row = QHBoxLayout()
         self.reset_button = QPushButton("Reset XP to 0"); self.reset_button.clicked.connect(self.reset_xp)
         self.clear_button = QPushButton("Delete ALL Tasks"); self.clear_button.clicked.connect(self.clear_all_tasks)
-        row.addStretch(1); row.addWidget(self.reset_button); row.addWidget(self.clear_button)
+        row.addStretch(1)
+        row.addWidget(self.reset_button)
+        row.addWidget(self.clear_button)
         layout.addLayout(row)
 
         layout.addStretch(1)
         self.tabs.addTab(tab, "Settings")
 
-        self.populate_mic_combo()
+    # -------------------- Theme & Accent --------------------
+    def on_theme_changed(self, text: str):
+        theme = text.lower()
+        self.cfg["theme"] = theme
+        _save_cfg(self.cfg)
+        self.apply_theme(theme)
+        self.apply_accent(self.cfg.get("accent", "#7AA2F7"))
+        self._apply_aurora_effects_if_needed()
+        self.refresh_calendar_marks()
 
-    def populate_mic_combo(self):
-        self.mic_combo.clear()
-        if not VOICE_OK:
-            self.mic_combo.addItem("SpeechRecognition not installed", -1)
-            self.mic_combo.setEnabled(False)
-            self.mic_refresh_btn.setEnabled(False)
-            self.mic_save_btn.setEnabled(False)
+    def on_accent_changed(self, text: str):
+        color = text
+        if text == "Custom…":
+            from PyQt5.QtWidgets import QColorDialog
+            chosen = QColorDialog.getColor(QColor(self.cfg.get("accent", "#7AA2F7")), self, "Pick Accent Color")
+            if chosen.isValid():
+                color = chosen.name()
+            else:
+                return
+        self.cfg["accent"] = color
+        _save_cfg(self.cfg)
+        self.apply_accent(color)
+        self.refresh_calendar_marks()
+
+    def apply_theme(self, theme: str):
+        app = QApplication.instance()
+        if not app:
             return
-        try:
-            names = sr.Microphone.list_microphone_names() or []
-        except Exception:
-            names = []
-
-        if not names:
-            self.mic_combo.addItem("No input devices found", -1)
-            self.mic_combo.setEnabled(False)
-            self.mic_save_btn.setEnabled(False)
-            return
-
-        self.mic_combo.setEnabled(True)
-        self.mic_save_btn.setEnabled(True)
-        for i, name in enumerate(names):
-            self.mic_combo.addItem(f"[{i}] {name}", i)
-
-        if isinstance(self.mic_index, int) and 0 <= self.mic_index < len(names):
-            idx = self.mic_combo.findData(self.mic_index)
-            if idx != -1:
-                self.mic_combo.setCurrentIndex(idx)
-
-    def save_mic_selection(self):
-        data = self.mic_combo.currentData()
-        if isinstance(data, int) and data >= 0:
-            self.mic_index = data
-            self.cfg["mic_device_index"] = data
-            _save_cfg(self.cfg)
-            # if already initialized, rebind live
-            if VOICE_OK and self._mic is not None:
-                try:
-                    self._mic = sr.Microphone(device_index=self.mic_index)
-                except Exception:
-                    pass
-            QMessageBox.information(self, "Microphone Saved", f"Using input device index {data}.")
+        theme = theme.lower()
+        if theme == "aurora":
+            app.setStyleSheet(self._aurora_qss())
+        elif theme == "dark":
+            app.setStyleSheet(self._dark_qss())
         else:
-            QMessageBox.warning(self, "Microphone", "Please select a valid input device.")
+            app.setStyleSheet(self._light_qss())
 
-    # =========================
-    # CRUD + UI refresh
-    # =========================
+    def apply_accent(self, hex_color: str):
+        accent = hex_color
+        # These overrides work across all themes
+        self.setStyleSheet(f"""
+        QLineEdit:focus, QTextEdit:focus, QListWidget:focus {{ border: 1px solid {accent}; }}
+        QListWidget::item:selected {{ background: {accent}; color: white; }}
+        QPushButton:hover {{ border: 1px solid {accent}; }}
+        QProgressBar::chunk {{ background-color: {accent}; }}
+        """)
+
+    def _apply_aurora_effects_if_needed(self):
+        if self.cfg.get("theme", "aurora").lower() != "aurora":
+            return
+        self._apply_aurora_effects()
+
+    def _apply_aurora_effects(self):
+        # Soft glow around "cards"
+        def glow(w, radius=24, alpha=0.22):
+            eff = QGraphicsDropShadowEffect(self)
+            eff.setColor(QColor(122, 162, 247, int(alpha * 255)))
+            eff.setBlurRadius(radius)
+            eff.setOffset(0, 6)
+            w.setGraphicsEffect(eff)
+
+        for w in [
+            getattr(self, "task_list", None),
+            getattr(self, "task_details", None),
+            getattr(self, "search_input", None),
+            getattr(self, "due_date_input", None),
+            getattr(self, "level_bar", None),
+            getattr(self, "calendar", None),
+            getattr(self, "cal_tasks_list", None),
+        ]:
+            if w:
+                glow(w)
+
+    def _aurora_qss(self) -> str:
+        # Aurora: glassy cards on blue-violet gradient (QSS-safe)
+        return """
+        QWidget {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #0f1424, stop:0.5 #151a2d, stop:1 #1b213a);
+            color: #EAF2FF; font-size: 14px;
+        }
+        QLabel { color: #EAF2FF; }
+
+        /* Glass cards */
+        QLineEdit, QTextEdit, QListWidget, QComboBox, QCalendarWidget,
+        QTabWidget::pane, QProgressBar {
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 12px;
+            padding: 6px;
+        }
+        QCalendarWidget QWidget { background: transparent; color: #EAF2FF; }
+
+        /* Inputs focus ring (just border color) */
+        QLineEdit:focus, QTextEdit:focus, QListWidget:focus, QComboBox:focus {
+            border: 1px solid #7AA2F7;
+        }
+
+        /* Buttons: gradient; no CSS filters */
+        QPushButton {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #4A5EEA, stop:1 #6ED3FF);
+            color: #ffffff; border: 0; border-radius: 10px; padding: 7px 12px;
+        }
+        QPushButton:hover {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #5567f0, stop:1 #7ae0ff);
+        }
+        QPushButton:pressed {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #3d54d9, stop:1 #55c7f5);
+        }
+
+        /* Secondary/chip look when property flat=true */
+        QPushButton[flat="true"] {
+            background: rgba(255,255,255,0.08); color: #EAF2FF;
+            border: 1px solid rgba(255,255,255,0.12);
+        }
+        QPushButton[flat="true"]:hover {
+            border: 1px solid rgba(122,162,247,0.45);
+            background: rgba(122,162,247,0.12);
+        }
+        QPushButton[flat="true"]:pressed {
+            background: rgba(122,162,247,0.22);
+        }
+
+        /* Tabs */
+        QTabBar::tab {
+            background: rgba(255,255,255,0.08);
+            color: #DDE9FF; padding: 8px 14px;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-top-left-radius: 10px; border-top-right-radius: 10px;
+            margin-right: 6px;
+        }
+        QTabBar::tab:selected {
+            background: rgba(122,162,247,0.18); color: #FFFFFF;
+            border: 1px solid rgba(122,162,247,0.35);
+        }
+
+        /* Lists & selection */
+        QListWidget::item { padding: 6px; margin: 3px 4px; border-radius: 8px; }
+        QListWidget::item:selected { background: rgba(122,162,247,0.35); color: #FFFFFF; }
+
+        /* Combo popup */
+        QComboBox QAbstractItemView {
+            background: rgba(20,25,45,0.98);
+            color: #EAF2FF; border: 1px solid rgba(255,255,255,0.12);
+            selection-background-color: rgba(122,162,247,0.35);
+        }
+
+        /* Progress */
+        QProgressBar { text-align: center; height: 18px; }
+        QProgressBar::chunk {
+            background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                        stop:0 #8A7DFF, stop:1 #4AD0FF);
+            border-radius: 8px;
+        }
+
+        /* Calendar tweaks */
+        QCalendarWidget QTableView::item:selected {
+            background: rgba(122,162,247,0.35);
+        }
+        QCalendarWidget QToolButton {
+            background: transparent; color: #EAF2FF; border: 0; padding: 4px 8px;
+        }
+        """
+
+    def _light_qss(self) -> str:
+        return """
+        QWidget { background: #ffffff; color: #111111; font-size: 14px; }
+        QLabel { color: #222222; }
+        QLineEdit, QTextEdit, QListWidget {
+            background: #ffffff; color: #111111; border: 1px solid #cfcfcf; border-radius: 6px; padding: 6px;
+        }
+        QPushButton {
+            background: #f3f3f3; color: #111111; border: 1px solid #cfcfcf; border-radius: 8px; padding: 6px 10px;
+        }
+        QPushButton:pressed { background: #e0e0e0; }
+        QTabWidget::pane { border: 1px solid #cfcfcf; border-radius: 8px; }
+        QTabBar::tab {
+            background: #f6f6f6; padding: 8px 12px; border: 1px solid #cfcfcf; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px;
+        }
+        QTabBar::tab:selected { background: #ffffff; }
+        QComboBox {
+            background: #ffffff; color: #111111; border: 1px solid #cfcfcf; border-radius: 6px; padding: 4px 8px;
+        }
+        QComboBox QAbstractItemView { background: #ffffff; color: #111111; selection-background-color: #e6f0ff; }
+        QProgressBar { border: 1px solid #cfcfcf; border-radius: 6px; height: 16px; text-align: center; }
+        """
+
+    def _dark_qss(self) -> str:
+        return """
+        QWidget { background: #121212; color: #e6e6e6; font-size: 14px; }
+        QLabel { color: #e6e6e6; }
+        QLineEdit, QTextEdit, QListWidget {
+            background: #1e1e1e; color: #e6e6e6; border: 1px solid #3a3a3a; border-radius: 6px; padding: 6px;
+        }
+        QPushButton {
+            background: #232323; color: #e6e6e6; border: 1px solid #3a3a3a; border-radius: 8px; padding: 6px 10px;
+        }
+        QPushButton:pressed { background: #333333; }
+        QTabWidget::pane { border: 1px solid #3a3a3a; border-radius: 8px; }
+        QTabBar::tab {
+            background: #1a1a1a; padding: 8px 12px; border: 1px solid #3a3a3a; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; color: #cccccc;
+        }
+        QTabBar::tab:selected { background: #121212; color: #ffffff; }
+        QComboBox {
+            background: #1e1e1e; color: #e6e6e6; border: 1px solid #3a3a3a; border-radius: 6px; padding: 4px 8px;
+        }
+        QComboBox QAbstractItemView { background: #1e1e1e; color: #e6e6e6; selection-background-color: #2a3c55; }
+        QListWidget::item:selected { background: #2a3c55; }
+        QProgressBar { border: 1px solid #3a3a3a; border-radius: 6px; height: 16px; text-align: center; }
+        """
+
+    # -------------------- CRUD --------------------
     def add_task(self):
         title = self.task_input.text().strip()
-        description = self.task_desc.toPlainText().strip()
+        description = self.task_desc_input.toPlainText().strip()
         due = self.due_date_input.text().strip()
+        prio = self.priority_combo.currentText().lower()
+        group = self.group_combo.currentText().strip()
 
         if not title:
             QMessageBox.warning(self, "Input Error", "Task title cannot be empty."); return
@@ -253,197 +643,475 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Input Error", "Due date must be YYYY-MM-DD."); return
 
         db.add_task(self.user[0], title, description, due or None)
-        self.task_input.clear(); self.task_desc.clear(); self.due_date_input.clear()
+        self.task_input.clear()
+        self.task_desc_input.clear()
+        self.due_date_input.clear()
+
         self.refresh_tasks()
+        tasks = db.get_tasks(self.user[0])
+        if tasks:
+            new_task_id = tasks[-1][0]
+            self.ucfg["priorities"][str(new_task_id)] = prio
+            if group:
+                self.ucfg["task_groups"][str(new_task_id)] = group
+                if group not in self.ucfg["groups"]:
+                    self.ucfg["groups"].append(group)
+            _save_cfg(self.cfg)
+            self.refresh_group_controls()
+            self.refresh_tasks()
 
     def refresh_tasks(self):
+        prev_id = None
+        item = getattr(self, "task_list", None)
+        if item and item.currentItem():
+            try:
+                prev_id = int(item.currentItem().text().split("]")[0].split("[")[1])
+            except Exception:
+                prev_id = None
+
         self.task_list.clear()
+        query = self.search_input.text().strip().lower() if hasattr(self, "search_input") else ""
+        filter_mode = self.status_filter.currentText() if hasattr(self, "status_filter") else "All"
+        gfilter = self.group_filter.currentText() if hasattr(self, "group_filter") else "All Groups"
+
         for task in db.get_tasks(self.user[0]):
-            # (id, user_id, title, description, complete, due_date)
-            status = "✅" if task[4] else "❌"
-            due = ""
-            if task[5]:
+            # task[0]=id, task[2]=title, task[4]=completed, task[5]=due_date
+            task_id = task[0]
+            title = task[2]
+            completed = bool(task[4])
+            due_val = task[5]
+
+            # description for search
+            conn = db.get_connection(); cur = conn.cursor()
+            cur.execute("SELECT description FROM tasks WHERE id=?", (task_id,))
+            rr = cur.fetchone()
+            conn.close()
+            desc = (rr[0] if rr else "") or ""
+
+            group = self.ucfg["task_groups"].get(str(task_id), "")
+
+            # Filters
+            if gfilter != "All Groups" and group != gfilter:
+                continue
+            if query:
+                hay = f"{title}\n{desc}".lower()
+                if query not in hay:
+                    continue
+            if filter_mode == "Completed" and not completed:
+                continue
+            if filter_mode == "Not Completed" and completed:
+                continue
+            if filter_mode == "Due Today":
+                if not due_val:
+                    continue
                 try:
-                    dt = datetime.strptime(task[5], "%Y-%m-%d").date()
-                    due = " (Due Today!)" if dt == date.today() else f" (Due: {dt.strftime('%B %d, %Y')})"
+                    dt = datetime.strptime(due_val, "%Y-%m-%d").date()
+                    if dt != date.today():
+                        continue
                 except Exception:
-                    due = f" (Due: {task[5]})"
-            txt = f"{status} [{task[0]}] {task[2]}{due}"
+                    continue
+
+            prio = self.ucfg["priorities"].get(str(task_id), "low")
+            picon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(prio, "🟢")
+            status = "✅" if completed else "❌"
+            due_txt = ""
+            if due_val:
+                try:
+                    dt = datetime.strptime(due_val, "%Y-%m-%d").date()
+                    due_txt = " (Due Today!)" if dt == date.today() else f" (Due: {dt.strftime('%B %d, %Y')})"
+                except Exception:
+                    due_txt = f" (Due: {due_val})"
+            group_badge = f"[{group}] " if group else ""
+            txt = f"{status} {picon} [{task_id}] {group_badge}{title}{due_txt}"
             self.task_list.addItem(txt)
-            if "Due Today!" in due:
-                self.task_list.item(self.task_list.count()-1).setForeground(Qt.red)
+            if "Due Today!" in due_txt and not completed:
+                self.task_list.item(self.task_list.count() - 1).setForeground(Qt.red)
+
         self.refresh_user_info()
+        self.refresh_calendar_marks()
+
+        if prev_id is not None:
+            for i in range(self.task_list.count()):
+                if f"[{prev_id}]" in self.task_list.item(i).text():
+                    self.task_list.setCurrentRow(i)
+                    break
 
     def refresh_user_info(self):
         xp = db.get_user_xp(self.user[0])
         self.user_label.setText(f"XP: {xp}")
         self.level_label.setText(f"Level: {xp // 100}")
+        self.level_bar.setValue(xp % 100)
+        self.update_streak_label()
 
     def complete_task(self):
         item = self.task_list.currentItem()
-        if not item: return
+        if not item:
+            return
         task_id = int(item.text().split("]")[0].split("[")[1])
         db.complete_task(task_id, self.user[0])
+        self._log_completion_today()
         self.refresh_tasks()
 
     def delete_task(self):
         item = self.task_list.currentItem()
-        if not item: return
+        if not item:
+            return
         task_id = int(item.text().split("]")[0].split("[")[1])
         if QMessageBox.question(self, "Delete", "Delete this task?",
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
             db.delete_task(task_id)
+            self.ucfg["priorities"].pop(str(task_id), None)
+            self.ucfg["task_groups"].pop(str(task_id), None)
+            for day, arr in list(self.ucfg.get("reminded", {}).items()):
+                self.ucfg["reminded"][day] = [x for x in arr if str(x) != str(task_id)]
+            _save_cfg(self.cfg)
             self.refresh_tasks()
 
     def show_description(self):
         item = self.task_list.currentItem()
         if not item:
-            self.task_description_label.setText("Select a task to see its description."); return
+            self.task_details.setPlainText("Select a task to see its description.")
+            return
         try:
             task_id = int(item.text().split("]")[0].split("[")[1])
         except Exception:
-            self.task_description_label.setText("Select a task to see its description."); return
+            self.task_details.setPlainText("Select a task to see its description.")
+            return
 
         conn = db.get_connection(); cur = conn.cursor()
         cur.execute("SELECT title, description, due_date FROM tasks WHERE id=?", (task_id,))
         row = cur.fetchone(); conn.close()
         if not row:
-            self.task_description_label.setText("Select a task to see its description."); return
+            self.task_details.setPlainText("Select a task to see its description.")
+            return
+
         title, desc, due = row
         due_txt = ""
         if due:
             try:
                 dt = datetime.strptime(due, "%Y-%m-%d").date()
-                due_txt = "\nDue Date: Today" if dt == date.today() else f"\nDue Date: {dt.strftime('%B %d, %Y')}"
+                due_txt = "Today" if dt == date.today() else dt.strftime("%B %d, %Y")
             except Exception:
-                due_txt = f"\nDue Date: {due}"
-        self.task_description_label.setText(f"Title: {title}\n\nDescription:\n{desc}{due_txt}")
+                due_txt = due
 
-    # settings actions
+        prio = self.ucfg["priorities"].get(str(task_id), "low").capitalize()
+        group = self.ucfg["task_groups"].get(str(task_id), "")
+        group_line = f"\nGroup: {group}" if group else ""
+        body = f"Title: {title}{group_line}\nPriority: {prio}"
+        if due_txt:
+            body += f"\nDue Date: {due_txt}"
+        body += f"\n\nDescription:\n{desc or '(no description)'}"
+        self.task_details.setPlainText(body)
+
+    def open_details_popup(self):
+        item = self.task_list.currentItem()
+        if not item:
+            return
+        try:
+            task_id = int(item.text().split("]")[0].split("[")[1])
+        except Exception:
+            return
+
+        conn = db.get_connection(); cur = conn.cursor()
+        cur.execute("SELECT title, description, due_date FROM tasks WHERE id=?", (task_id,))
+        row = cur.fetchone(); conn.close()
+        if not row:
+            return
+        title, desc, due = row
+        prio = self.ucfg["priorities"].get(str(task_id), "low").capitalize()
+        group = self.ucfg["task_groups"].get(str(task_id), "")
+        due_txt = ""
+        if due:
+            try:
+                dt = datetime.strptime(due, "%Y-%m-%d").date()
+                due_txt = "Today" if dt == date.today() else dt.strftime("%B %d, %Y")
+            except Exception:
+                due_txt = due
+        gline = f"\nGroup: {group}" if group else ""
+        content = f"Title: {title}{gline}\nPriority: {prio}"
+        if due_txt:
+            content += f"\nDue Date: {due_txt}"
+        content += f"\n\nDescription:\n{desc or '(no description)'}"
+
+        dlg = QDialog(self); dlg.setWindowTitle(f"Task Details - [{task_id}] {title}")
+        v = QVBoxLayout(dlg)
+        te = QTextEdit(); te.setReadOnly(True); te.setPlainText(content)
+        v.addWidget(te)
+        row = QHBoxLayout(); row.addStretch(1)
+        btn_copy = QPushButton("Copy"); btn_close = QPushButton("Close")
+        row.addWidget(btn_copy); row.addWidget(btn_close); v.addLayout(row)
+        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(content))
+        btn_close.clicked.connect(dlg.close)
+        dlg.resize(520, 400)
+        dlg.exec_()
+
+    # -------------------- Bulk Add --------------------
+    def bulk_add_tasks(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Bulk Add Tasks to a Group")
+        vv = QVBoxLayout(dlg)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Group:"))
+        group_box = QComboBox()
+        group_box.setEditable(True)
+        for g in self.ucfg.get("groups", []):
+            group_box.addItem(g)
+        row1.addWidget(group_box, 1)
+        vv.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Due Date (optional):"))
+        due_edit = QLineEdit(placeholderText="YYYY-MM-DD (applies to all)")
+        row2.addWidget(due_edit, 1)
+        vv.addLayout(row2)
+
+        vv.addWidget(QLabel("One task title per line:"))
+        titles_edit = QPlainTextEdit()
+        titles_edit.setPlaceholderText("Assignment 1\nAssignment 2\nAssignment 3")
+        titles_edit.setFixedHeight(180)
+        vv.addWidget(titles_edit)
+
+        row3 = QHBoxLayout()
+        ok_btn = QPushButton("Add")
+        cancel_btn = QPushButton("Cancel")
+        row3.addStretch(1)
+        row3.addWidget(ok_btn)
+        row3.addWidget(cancel_btn)
+        vv.addLayout(row3)
+
+        def _accept():
+            due_str = due_edit.text().strip()
+            if due_str and not re.match(r"^\d{4}-\d{2}-\d{2}$", due_str):
+                QMessageBox.warning(dlg, "Input Error", "Due date must be YYYY-MM-DD.")
+                return
+            lines = [ln.strip() for ln in titles_edit.toPlainText().splitlines()]
+            lines = [ln for ln in lines if ln]
+            if not lines:
+                QMessageBox.warning(dlg, "Input Error", "Enter at least one title.")
+                return
+            dlg.done(1)
+
+        ok_btn.clicked.connect(_accept)
+        cancel_btn.clicked.connect(lambda: dlg.done(0))
+
+        if dlg.exec_() != 1:
+            return
+
+        group_name = group_box.currentText().strip()
+        due_str = due_edit.text().strip()
+        titles = [ln.strip() for ln in titles_edit.toPlainText().splitlines() if ln.strip()]
+
+        imported = 0
+        for title in titles:
+            db.add_task(self.user[0], title, "", due_str or None)
+            imported += 1
+
+        if imported:
+            tasks_now = db.get_tasks(self.user[0])
+            new_ids = [x[0] for x in tasks_now[-imported:]]
+            for new_id in new_ids:
+                if group_name:
+                    self.ucfg["task_groups"][str(new_id)] = group_name
+            if group_name and group_name not in self.ucfg["groups"]:
+                self.ucfg["groups"].append(group_name)
+            _save_cfg(self.cfg)
+            self.refresh_group_controls()
+            self.refresh_tasks()
+            QMessageBox.information(self, "Bulk Add", f"Added {imported} tasks to group '{group_name or 'No Group'}'.")
+
+    # -------------------- Reminders & Streak --------------------
+    def check_due_reminders(self):
+        today = _today_iso()
+        reminded_today = set(map(str, self.ucfg.get("reminded", {}).get(today, [])))
+        to_add = []
+
+        for task in db.get_tasks(self.user[0]):
+            task_id = str(task[0])
+            completed = bool(task[4])
+            due = task[5]
+            if completed or not due:
+                continue
+            try:
+                dt = datetime.strptime(due, "%Y-%m-%d").date()
+            except Exception:
+                continue
+
+            if dt == date.today() and task_id not in reminded_today:
+                title = task[2]
+                group = self.ucfg["task_groups"].get(task_id, "")
+                gtxt = f" [{group}]" if group else ""
+                QMessageBox.information(self, "Reminder", f"⚠️ '{title}'{gtxt} is due today.")
+                to_add.append(task_id)
+
+        if to_add:
+            self.ucfg.setdefault("reminded", {})
+            self.ucfg["reminded"].setdefault(today, [])
+            self.ucfg["reminded"][today].extend(to_add)
+            _save_cfg(self.cfg)
+
+    def _log_completion_today(self):
+        today = _today_iso()
+        logs = self.ucfg.get("completion_log", [])
+        if today not in logs:
+            logs.append(today)
+            self.ucfg["completion_log"] = logs
+            _save_cfg(self.cfg)
+
+    def update_streak_label(self):
+        logs = sorted(set(self.ucfg.get("completion_log", [])))
+        if not logs:
+            self.streak_label.setText("🔥 Streak: 0")
+            return
+        streak = 0
+        cur = date.today()
+        logset = set(logs)
+        while cur.isoformat() in logset:
+            streak += 1
+            cur -= timedelta(days=1)
+        self.streak_label.setText(f"🔥 Streak: {streak}")
+
+    # -------------------- Export / Import --------------------
+    def export_tasks(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Tasks", "tasks_export.json", "JSON Files (*.json)")
+        if not path:
+            return
+        tasks_out = []
+        for task in db.get_tasks(self.user[0]):
+            task_id = task[0]
+            conn = db.get_connection(); cur = conn.cursor()
+            cur.execute("SELECT description FROM tasks WHERE id=?", (task_id,))
+            rr = cur.fetchone()
+            conn.close()
+            desc = (rr[0] if rr else "") or ""
+            tasks_out.append({
+                "id": task_id,
+                "title": task[2],
+                "description": desc,
+                "completed": bool(task[4]),
+                "due_date": task[5],
+                "priority": self.ucfg["priorities"].get(str(task_id), "low"),
+                "group": self.ucfg["task_groups"].get(str(task_id), "")
+            })
+
+        data = {
+            "user": {"id": self.user[0], "username": self.user[1]},
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "tasks": tasks_out,
+            "groups": self.ucfg.get("groups", [])
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            QMessageBox.information(self, "Export", "Tasks exported successfully.")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Error", f"Failed to export tasks:\n{e}")
+
+    def import_tasks(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Tasks", "", "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Import Error", f"Invalid JSON file:\n{e}")
+            return
+
+        tasks = data.get("tasks", [])
+        if not isinstance(tasks, list):
+            QMessageBox.warning(self, "Import Error", "No tasks found in file.")
+            return
+
+        imported = 0
+        groups_from_file = set(data.get("groups", []))
+
+        sanitized = []
+        for t in tasks:
+            title = (t.get("title") or "").strip()
+            desc = (t.get("description") or "").strip()
+            due = (t.get("due_date") or None)
+            prio = (t.get("priority") or "low").lower()
+            grp = (t.get("group") or "").strip()
+            if not title:
+                continue
+            if due and not re.match(r"^\d{4}-\d{2}-\d{2}$", due):
+                due = None
+            sanitized.append((title, desc, due, prio, grp))
+
+        for title, desc, due, prio, grp in sanitized:
+            db.add_task(self.user[0], title, desc, due)
+            imported += 1
+
+        if imported:
+            tasks_now = db.get_tasks(self.user[0])
+            new_ids = [x[0] for x in tasks_now[-imported:]]
+            for (new_id, (title, desc, due, prio, grp)) in zip(new_ids, sanitized):
+                self.ucfg["priorities"][str(new_id)] = prio
+                if grp:
+                    self.ucfg["task_groups"][str(new_id)] = grp
+                    groups_from_file.add(grp)
+
+            for g in groups_from_file:
+                if g and g not in self.ucfg["groups"]:
+                    self.ucfg["groups"].append(g)
+
+            _save_cfg(self.cfg)
+            self.refresh_group_controls()
+            self.refresh_tasks()
+            QMessageBox.information(self, "Import", f"Imported {imported} tasks.")
+        else:
+            QMessageBox.information(self, "Import", "Nothing to import.")
+
+    # -------------------- Settings actions --------------------
     def reset_xp(self):
-        if QMessageBox.question(self, "Reset XP", "Reset your XP to 0?",
-                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+        if QMessageBox.question(
+            self, "Reset XP", "Reset your XP to 0?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) == QMessageBox.Yes:
             conn = db.get_connection(); cur = conn.cursor()
             cur.execute("UPDATE users SET xp = 0 WHERE id=?", (self.user[0],))
             conn.commit(); conn.close()
             self.refresh_user_info()
+            self.refresh_calendar_marks()
 
     def clear_all_tasks(self):
-        if QMessageBox.question(self, "Delete All Tasks", "Delete ALL your tasks?",
-                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+        if QMessageBox.question(
+            self, "Delete All Tasks", "Delete ALL your tasks?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) == QMessageBox.Yes:
             conn = db.get_connection(); cur = conn.cursor()
             cur.execute("DELETE FROM tasks WHERE user_id=?", (self.user[0],))
             conn.commit(); conn.close()
             self.refresh_tasks()
 
-    # =========================
-    # Voice helpers
-    # =========================
-    def _init_voice(self):
-        """Lazy-init recognizer and microphone. Calibrate quickly once."""
-        if not VOICE_OK:
-            raise RuntimeError("SpeechRecognition not available")
+    # -------------------- Helpers --------------------
+    def refresh_group_controls(self):
+        # Add-task combo
+        current = self.group_combo.currentText().strip() if hasattr(self, "group_combo") else ""
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        for g in self.ucfg.get("groups", []):
+            self.group_combo.addItem(g)
+        if current and current not in self.ucfg["groups"]:
+            self.group_combo.addItem(current)
+        if current:
+            self.group_combo.setEditText(current)
+        self.group_combo.blockSignals(False)
 
-        if self._r is None:
-            self._r = sr.Recognizer()
-            self._r.dynamic_energy_threshold = False
-            self._r.energy_threshold = 500
-            self._r.pause_threshold = 0.7
-            self._r.non_speaking_duration = 0.3
-
-        if self._mic is None:
-            self._mic = sr.Microphone(device_index=self.mic_index)
-            try:
-                with self._mic as src:
-                    # short ambient calibration prevents “listening forever”
-                    self._r.adjust_for_ambient_noise(src, duration=0.25)
-            except Exception:
-                pass
-
-    def _ui_listen_state(self, btn: QPushButton, lbl: QLabel, on: bool):
-        if on:
-            btn.setText("●"); btn.setEnabled(False)
-            btn.setStyleSheet("background:#e74c3c; color:white;")
-            lbl.setText("listening…")
-        else:
-            btn.setText("🎤"); btn.setEnabled(True)
-            btn.setStyleSheet("")
-            lbl.setText("")
-
-    def _stop_bg_ui(self, btn, lbl):
-        # stop listener (quick) and reset UI on the UI thread
-        if self._bg_stop:
-            try:
-                self._bg_stop(wait_for_stop=False)
-            except Exception:
-                pass
-            self._bg_stop = None
-        if self._listen_timer and self._listen_timer.isActive():
-            self._listen_timer.stop()
-        self._listen_timer = None
-        self._ui_listen_state(btn, lbl, False)
-
-    def _start_bg(self, btn, lbl, setter, hard_cap_ms=9000):
-        try:
-            self._init_voice()
-        except Exception:
-            self._ui_listen_state(btn, lbl, False); return
-
-        # stop any previous listener
-        if self._bg_stop:
-            self._stop_bg_ui(btn, lbl)
-
-        self._ui_listen_state(btn, lbl, True)
-
-        def _callback(recognizer, audio):
-            def _recognize():
-                text = None
-                try:
-                    text = recognizer.recognize_google(audio, language="en-US").strip()
-                except Exception:
-                    text = None
-                # marshal back to UI thread
-                QTimer.singleShot(0, lambda: (setter(text) if text else None, self._stop_bg_ui(btn, lbl)))
-            threading.Thread(target=_recognize, daemon=True).start()
-
-        try:
-            self._bg_stop = self._r.listen_in_background(self._mic, _callback)
-        except Exception:
-            self._bg_stop = None
-            self._ui_listen_state(btn, lbl, False)
-            return
-
-        # watchdog so the UI never gets stuck
-        self._listen_timer = QTimer(self)
-        self._listen_timer.setSingleShot(True)
-        self._listen_timer.timeout.connect(lambda: self._stop_bg_ui(btn, lbl))
-        self._listen_timer.start(hard_cap_ms)
-
-    # mic handlers
-    def mic_fill_title(self):
-        self.task_input.setFocus()
-        self._start_bg(self.title_mic_btn, self.title_status,
-                       lambda t: self.task_input.setText(t) if t else None,
-                       hard_cap_ms=9000)
-
-    def mic_fill_description(self):
-        self.task_desc.setFocus()
-        self._start_bg(self.desc_mic_btn, self.desc_status,
-                       lambda t: self.task_desc.setPlainText(t) if t else None,
-                       hard_cap_ms=11000)
-
-    # clean shutdown (join SR worker)
-    def _shutdown_voice(self):
-        if self._bg_stop:
-            try:
-                self._bg_stop(wait_for_stop=True)  # join thread on exit
-            except Exception:
-                pass
-            self._bg_stop = None
-        if self._listen_timer and self._listen_timer.isActive():
-            self._listen_timer.stop()
-        self._listen_timer = None
+        # Filter combo
+        sel = self.group_filter.currentText() if hasattr(self, "group_filter") else "All Groups"
+        self.group_filter.blockSignals(True)
+        self.group_filter.clear()
+        self.group_filter.addItem("All Groups")
+        for g in self.ucfg.get("groups", []):
+            self.group_filter.addItem(g)
+        idx = 0
+        for i in range(self.group_filter.count()):
+            if self.group_filter.itemText(i) == sel:
+                idx = i; break
+        self.group_filter.setCurrentIndex(idx)
+        self.group_filter.blockSignals(False)
 
     def closeEvent(self, e):
-        self._shutdown_voice()
         super().closeEvent(e)
