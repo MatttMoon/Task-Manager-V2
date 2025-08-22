@@ -38,13 +38,24 @@
         "Math",
         "English"
       ],
-      "task_groups": {},
-      "priorities": {},
+      "task_groups": {
+        "26": "Math",
+        "28": "English"
+      },
+      "priorities": {
+        "26": "low",
+        "27": "medium",
+        "28": "high",
+        "29": "low"
+      },
       "completion_log": [
         "2025-08-22"
       ],
       "reminded": {
-        "2025-08-22": []
+        "2025-08-22": [
+          "26",
+          "27"
+        ]
       }
     },
     "5": {
