@@ -12,6 +12,12 @@ from db import database as db
 import re, json, os
 
 from core.config import load_cfg, save_cfg, user_bucket
+from core.theme import (
+    apply_theme_to_app,
+    apply_accent_to_window,
+    apply_aurora_effects_if_needed,
+)
+
 
 # -------------------- Config (global + per-user) --------------------
 CONFIG_FILE = "app_settings.json"
@@ -51,10 +57,10 @@ class MainWindow(QWidget):
         self.init_calendar_tab()
         self.init_settings_tab()
 
-        # apply theme after UI exists
-        self.apply_theme(self.cfg.get("theme", "aurora"))
-        self.apply_accent(self.cfg.get("accent", "#7AA2F7"))
-        self._apply_aurora_effects_if_needed()
+        apply_theme_to_app(self.cfg.get("theme", "aurora"))
+        apply_accent_to_window(self, self.cfg.get("accent", "#7AA2F7"))
+        apply_aurora_effects_if_needed(self, self.cfg)
+
 
         # initial data
         self.refresh_group_controls()
@@ -452,10 +458,11 @@ class MainWindow(QWidget):
         theme = text.lower()
         self.cfg["theme"] = theme
         save_cfg(self.cfg)
-        self.apply_theme(theme)
-        self.apply_accent(self.cfg.get("accent", "#7AA2F7"))
-        self._apply_aurora_effects_if_needed()
+        apply_theme_to_app(theme)
+        apply_accent_to_window(self, self.cfg.get("accent", "#7AA2F7"))
+        apply_aurora_effects_if_needed(self, self.cfg)
         self.refresh_calendar_marks()
+
 
     def on_accent_changed(self, text: str):
         color = text
@@ -468,226 +475,9 @@ class MainWindow(QWidget):
                 return
         self.cfg["accent"] = color
         save_cfg(self.cfg)
-        self.apply_accent(color)
+        apply_accent_to_window(self, color)
         self.refresh_calendar_marks()
 
-    def apply_theme(self, theme: str):
-        app = QApplication.instance()
-        if not app:
-            return
-        theme = theme.lower()
-        if theme == "aurora":
-            app.setStyleSheet(self._aurora_qss())
-        elif theme == "dark":
-            app.setStyleSheet(self._dark_qss())
-        else:
-            app.setStyleSheet(self._light_qss())
-
-    def apply_accent(self, hex_color: str):
-        accent = hex_color
-        # overrides work across all themes
-        self.setStyleSheet(f"""
-        QLineEdit:focus, QTextEdit:focus, QListWidget:focus {{ border: 1px solid {accent}; }}
-        QListWidget::item:selected {{ background: {accent}; color: white; }}
-        QPushButton:hover {{ border: 1px solid {accent}; }}
-        QProgressBar::chunk {{ background-color: {accent}; }}
-        """)
-
-    def _apply_aurora_effects_if_needed(self):
-        if self.cfg.get("theme", "aurora").lower() != "aurora":
-            return
-        self._apply_aurora_effects()
-
-    def _apply_aurora_effects(self):
-        # Soft glow around "cards"
-        def glow(w, radius=24, alpha=0.22):
-            eff = QGraphicsDropShadowEffect(self)
-            eff.setColor(QColor(122, 162, 247, int(alpha * 255)))
-            eff.setBlurRadius(radius)
-            eff.setOffset(0, 6)
-            w.setGraphicsEffect(eff)
-
-        for w in [
-            getattr(self, "task_list", None),
-            getattr(self, "task_details", None),
-            getattr(self, "search_input", None),
-            getattr(self, "due_date_input", None),
-            getattr(self, "level_bar", None),
-            getattr(self, "calendar", None),
-            getattr(self, "cal_tasks_list", None),
-        ]:
-            if w:
-                glow(w)
-
-    def _aurora_qss(self) -> str:
-        # Aurora: glassy cards on blue-violet gradient (QSS-safe)
-        return """
-        QWidget {
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                        stop:0 #0f1424, stop:0.5 #151a2d, stop:1 #1b213a);
-            color: #EAF2FF; font-size: 14px;
-        }
-        QLabel { color: #EAF2FF; }
-
-        /* Glass cards */
-        QLineEdit, QTextEdit, QListWidget, QComboBox, QCalendarWidget,
-        QTabWidget::pane, QProgressBar {
-            background: rgba(255,255,255,0.06);
-            border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 12px;
-            padding: 6px;
-        }
-        QCalendarWidget QWidget { background: transparent; color: #EAF2FF; }
-
-        /* Inputs focus ring (just border color) */
-        QLineEdit:focus, QTextEdit:focus, QListWidget:focus, QComboBox:focus {
-            border: 1px solid #7AA2F7;
-        }
-
-        /* Buttons: gradient; no CSS filters */
-        QPushButton {
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                        stop:0 #4A5EEA, stop:1 #6ED3FF);
-            color: #ffffff; border: 0; border-radius: 10px; padding: 7px 12px;
-        }
-        QPushButton:hover {
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                        stop:0 #5567f0, stop:1 #7ae0ff);
-        }
-        QPushButton:pressed {
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                        stop:0 #3d54d9, stop:1 #55c7f5);
-        }
-
-        /* Secondary/chip look when property flat=true */
-        QPushButton[flat="true"] {
-            background: rgba(255,255,255,0.08); color: #EAF2FF;
-            border: 1px solid rgba(255,255,255,0.12);
-        }
-        QPushButton[flat="true"]:hover {
-            border: 1px solid rgba(122,162,247,0.45);
-            background: rgba(122,162,247,0.12);
-        }
-        QPushButton[flat="true"]:pressed {
-            background: rgba(122,162,247,0.22);
-        }
-
-        /* Tabs */
-        QTabBar::tab {
-            background: rgba(255,255,255,0.08);
-            color: #DDE9FF; padding: 8px 14px;
-            border: 1px solid rgba(255,255,255,0.12);
-            border-top-left-radius: 10px; border-top-right-radius: 10px;
-            margin-right: 6px;
-        }
-        QTabBar::tab:selected {
-            background: rgba(122,162,247,0.18); color: #FFFFFF;
-            border: 1px solid rgba(122,162,247,0.35);
-        }
-
-        /* Lists & selection */
-        QListWidget::item { padding: 6px; margin: 3px 4px; border-radius: 8px; }
-        QListWidget::item:selected { background: rgba(122,162,247,0.35); color: #FFFFFF; }
-
-        /* Combo popup */
-        QComboBox QAbstractItemView {
-            background: rgba(20,25,45,0.98);
-            color: #EAF2FF; border: 1px solid rgba(255,255,255,0.12);
-            selection-background-color: rgba(122,162,247,0.35);
-        }
-
-        /* Progress */
-        QProgressBar { text-align: center; height: 18px; }
-        QProgressBar::chunk {
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                        stop:0 #8A7DFF, stop:1 #4AD0FF);
-            border-radius: 8px;
-        }
-
-        /* Calendar tweaks (Aurora) */
-        QCalendarWidget {
-            background: transparent;
-            color: #EAF2FF;
-        }
-        QCalendarWidget QTableView {
-            background: rgba(255,255,255,0.05); /* soft slate instead of black */
-            alternate-background-color: transparent;
-            outline: 0;
-        }
-        QCalendarWidget QTableView:item {
-            padding: 6px;
-        }
-        QCalendarWidget QToolButton {
-            background: rgba(255,255,255,0.10);
-            border: 1px solid rgba(255,255,255,0.15);
-            border-radius: 8px;
-            padding: 4px 10px;
-        }
-        QCalendarWidget QToolButton:hover {
-            background: rgba(255,255,255,0.16);
-        }
-        QCalendarWidget QMenu {
-            background: rgba(20,25,45,0.98);
-            color: #EAF2FF;
-            border: 1px solid rgba(255,255,255,0.12);
-        }
-        QCalendarWidget QSpinBox, 
-        QCalendarWidget QComboBox {
-            background: rgba(255,255,255,0.10);
-            border: 1px solid rgba(255,255,255,0.15);
-            color: #EAF2FF;
-            border-radius: 6px;
-            padding: 2px 6px;
-        }
-
-        """
-
-    def _light_qss(self) -> str:
-        return """
-        QWidget { background: #ffffff; color: #111111; font-size: 14px; }
-        QLabel { color: #222222; }
-        QLineEdit, QTextEdit, QListWidget {
-            background: #ffffff; color: #111111; border: 1px solid #cfcfcf; border-radius: 6px; padding: 6px;
-        }
-        QPushButton {
-            background: #f3f3f3; color: #111111; border: 1px solid #cfcfcf; border-radius: 8px; padding: 6px 10px;
-        }
-        QPushButton:pressed { background: #e0e0e0; }
-        QTabWidget::pane { border: 1px solid #cfcfcf; border-radius: 8px; }
-        QTabBar::tab {
-            background: #f6f6f6; padding: 8px 12px; border: 1px solid #cfcfcf; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px;
-        }
-        QTabBar::tab:selected { background: #ffffff; }
-        QComboBox {
-            background: #ffffff; color: #111111; border: 1px solid #cfcfcf; border-radius: 6px; padding: 4px 8px;
-        }
-        QComboBox QAbstractItemView { background: #ffffff; color: #111111; selection-background-color: #e6f0ff; }
-        QProgressBar { border: 1px solid #cfcfcf; border-radius: 6px; height: 16px; text-align: center; }
-        """
-
-    def _dark_qss(self) -> str:
-        return """
-        QWidget { background: #121212; color: #e6e6e6; font-size: 14px; }
-        QLabel { color: #e6e6e6; }
-        QLineEdit, QTextEdit, QListWidget {
-            background: #1e1e1e; color: #e6e6e6; border: 1px solid #3a3a3a; border-radius: 6px; padding: 6px;
-        }
-        QPushButton {
-            background: #232323; color: #e6e6e6; border: 1px solid #3a3a3a; border-radius: 8px; padding: 6px 10px;
-        }
-        QPushButton:pressed { background: #333333; }
-        QTabWidget::pane { border: 1px solid #3a3a3a; border-radius: 8px; }
-        QTabBar::tab {
-            background: #1a1a1a; padding: 8px 12px; border: 1px solid #3a3a3a; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; color: #cccccc;
-        }
-        QTabBar::tab:selected { background: #121212; color: #ffffff; }
-        QComboBox {
-            background: #1e1e1e; color: #e6e6e6; border: 1px solid #3a3a3a; border-radius: 6px; padding: 4px 8px;
-        }
-        QComboBox QAbstractItemView { background: #1e1e1e; color: #e6e6e6; selection-background-color: #2a3c55; }
-        QListWidget::item:selected { background: #2a3c55; }
-        QProgressBar { border: 1px solid #3a3a3a; border-radius: 6px; height: 16px; text-align: center; }
-        """
 
     # -------------------- CRUD --------------------
     def add_task(self):

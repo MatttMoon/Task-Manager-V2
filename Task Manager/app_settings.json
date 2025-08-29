@@ -39,9 +39,12 @@
         "English",
         "sdfasdf"
       ],
-      "task_groups": {},
+      "task_groups": {
+        "37": "Math",
+        "38": "Math",
+        "39": "Math"
+      },
       "priorities": {
-        "33": "low",
         "34": "low"
       },
       "completion_log": [
