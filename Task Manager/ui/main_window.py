@@ -3,13 +3,13 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLabel, QLineEdit, QTextEdit,
     QListWidget, QMessageBox, QTabWidget, QHBoxLayout, QApplication, QComboBox,
     QFileDialog, QProgressBar, QCalendarWidget, QSplitter, QDialog, QPlainTextEdit,
-    QGraphicsDropShadowEffect
+    QGraphicsDropShadowEffect, QMenu
 )
 from PyQt5.QtCore import Qt, QTimer, QDate
 from PyQt5.QtGui import QColor, QTextCharFormat
 from datetime import datetime, date, timedelta
 from db import database as db
-import re, json, os, sys
+import re, json, os
 
 # -------------------- Config (global + per-user) --------------------
 CONFIG_FILE = "app_settings.json"
@@ -162,7 +162,13 @@ class MainWindow(QWidget):
         trow.addWidget(QLabel("Group:"))
         self.group_combo = QComboBox()
         self.group_combo.setEditable(True)  # type a new group or pick existing
+        self.group_combo.setInsertPolicy(QComboBox.NoInsert)
         trow.addWidget(self.group_combo)
+        # appear empty by default
+        self.group_combo.setCurrentIndex(-1)
+        self.group_combo.setEditText("")
+        if self.group_combo.lineEdit():
+            self.group_combo.lineEdit().setPlaceholderText("Group (optional)")
 
         trow.addSpacing(8)
         trow.addWidget(QLabel("Priority:"))
@@ -193,22 +199,24 @@ class MainWindow(QWidget):
         du.addStretch(1)
         layout.addLayout(du)
 
-        # Actions
-        btns = QHBoxLayout()
+        # Actions row (left | right). Selection actions live under the list.
+        actions = QHBoxLayout()
         self.add_button = QPushButton("➕ Add Task"); self.add_button.clicked.connect(self.add_task)
         self.bulk_button = QPushButton("🧺 Bulk Add"); self.bulk_button.clicked.connect(self.bulk_add_tasks)
-        self.complete_button = QPushButton("✔️ Mark Complete"); self.complete_button.clicked.connect(self.complete_task)
-        self.delete_button = QPushButton("🗑️ Delete Task"); self.delete_button.clicked.connect(self.delete_task)
-        self.export_button = QPushButton("📤 Export"); self.export_button.clicked.connect(self.export_tasks)
-        self.import_button = QPushButton("📥 Import"); self.import_button.clicked.connect(self.import_tasks)
-        for b in (self.add_button, self.bulk_button, self.complete_button,
-                  self.delete_button, self.export_button, self.import_button):
+        for b in (self.add_button, self.bulk_button):
             b.setProperty("flat", True)
-        btns.addStretch(1)
-        for b in (self.add_button, self.bulk_button, self.complete_button,
-                  self.delete_button, self.export_button, self.import_button):
-            btns.addWidget(b)
-        layout.addLayout(btns)
+        actions.addWidget(self.add_button)
+        actions.addWidget(self.bulk_button)
+        actions.addStretch(1)
+
+        self.data_button = QPushButton("📦 Import/Export ▾")
+        dm = QMenu(self)
+        dm.addAction("📥 Import Tasks", self.import_tasks).setShortcut("Ctrl+I")
+        dm.addAction("📤 Export Tasks", self.export_tasks).setShortcut("Ctrl+E")
+        self.data_button.setMenu(dm)
+        self.data_button.setProperty("flat", True)
+        actions.addWidget(self.data_button, 0, Qt.AlignRight)
+        layout.addLayout(actions)
 
         # Filters
         frow = QHBoxLayout()
@@ -233,12 +241,34 @@ class MainWindow(QWidget):
         frow.addWidget(self.status_filter)
         layout.addLayout(frow)
 
-        # List + details
+        # List + under-list selection toolbar
         layout.addWidget(QLabel("Your Tasks:"))
         self.task_list = QListWidget()
         self.task_list.itemSelectionChanged.connect(self.show_description)
         self.task_list.itemDoubleClicked.connect(lambda _: self.open_details_popup())
+        self.task_list.itemSelectionChanged.connect(self._update_list_actions)
         layout.addWidget(self.task_list, 1)
+
+        # Mini toolbar under the list (selection-specific)
+        list_actions = QHBoxLayout()
+        self.sel_label = QLabel("No task selected")
+        list_actions.addWidget(self.sel_label)
+        list_actions.addStretch(1)
+
+        self.complete_button = QPushButton("✔️ Mark Complete")
+        self.delete_button   = QPushButton("🗑️ Delete Task")
+        for b in (self.complete_button, self.delete_button):
+            b.setProperty("flat", True)
+        self.complete_button.clicked.connect(self.complete_task)
+        self.delete_button.clicked.connect(self.delete_task)
+        self.delete_button.setShortcut("Del")
+
+        self.complete_button.setEnabled(False)
+        self.delete_button.setEnabled(False)
+
+        list_actions.addWidget(self.complete_button)
+        list_actions.addWidget(self.delete_button)
+        layout.addLayout(list_actions)
 
         # Details header with Pop out
         hdr_details = QHBoxLayout()
@@ -278,6 +308,7 @@ class MainWindow(QWidget):
         self.calendar.setGridVisible(True)
         self.calendar.clicked.connect(self.on_calendar_date_changed)
         self.calendar.selectionChanged.connect(self.on_calendar_selection_changed)
+        self.calendar.currentPageChanged.connect(lambda *_: self.refresh_calendar_marks())
 
         right_box = QWidget()
         right_layout = QVBoxLayout(right_box)
@@ -340,10 +371,46 @@ class MainWindow(QWidget):
             self.cal_tasks_list.addItem(f"{status} {picon} [{task_id}] {group_badge}{title}")
 
     def refresh_calendar_marks(self):
-        self.calendar.setDateTextFormat(QDate(), QTextCharFormat())
-        marks = {}
-        for task in db.get_tasks(self.user[0]):
-            d = task[5]
+        cal = self.calendar
+
+        # Palette
+        accent_hex = self.cfg.get("accent", "#7AA2F7")
+        accent = QColor(accent_hex)
+        accent_soft = QColor(accent)
+        accent_soft.setAlphaF(0.22)
+        accent_strong = QColor(accent)
+        accent_strong.setAlphaF(0.38)
+
+        slate = QColor(34, 42, 64, int(255*0.60))   # default tile for in-month
+        slate_dim = QColor(34, 42, 64, int(255*0.28))  # out-of-month
+        text_main = QColor("#EAF2FF")
+        text_dim  = QColor(200, 210, 230, 160)
+
+        # Clear formats for the visible month to soft slate (not black)
+        year, month = cal.yearShown(), cal.monthShown()
+        first = QDate(year, month, 1)
+        days = first.daysInMonth()
+
+        base_fmt = QTextCharFormat()
+        base_fmt.setBackground(slate)
+        base_fmt.setForeground(text_main)
+
+        for d in range(1, days + 1):
+            cal.setDateTextFormat(QDate(year, month, d), base_fmt)
+
+            
+        # Iterate a bit around the month range to catch neighbors.
+        for delta in (-7, -6, -5, -4, -3, -2, -1, days+1, days+2, days+3, days+4, days+5, days+6, days+7):
+            qd = first.addDays(delta)
+            fmt = QTextCharFormat()
+            fmt.setBackground(slate_dim)
+            fmt.setForeground(text_dim)
+            cal.setDateTextFormat(qd, fmt)
+
+        # Build marks: any task on date, and if any are incomplete
+        marks = {}  # QDate -> (any, has_incomplete)
+        for t in db.get_tasks(self.user[0]):
+            d = t[5]
             if not d:
                 continue
             try:
@@ -351,16 +418,35 @@ class MainWindow(QWidget):
             except Exception:
                 continue
             qd = QDate(dt.year, dt.month, dt.day)
-            any_incomplete = not bool(task[4])
-            prev = marks.get(qd, (False, False))
-            marks[qd] = (True, prev[1] or any_incomplete)
+            any_in_month = (dt.year == year and dt.month == month)
+            if not any_in_month:
+                continue
+            completed = bool(t[4])
+            prev_any, prev_incomp = marks.get(qd, (False, False))
+            marks[qd] = (True, prev_incomp or (not completed))
 
+        # Apply accent for days with tasks
         for qd, (_any, has_incomplete) in marks.items():
             fmt = QTextCharFormat()
-            fmt.setFontWeight(75)
-            fmt.setForeground(QColor(self.cfg.get("accent", "#7AA2F7") if has_incomplete else "#7aa2f7"))
-            self.calendar.setDateTextFormat(qd, fmt)
+            fmt.setForeground(text_main)
+            if has_incomplete:
+                fmt.setBackground(accent_strong)   # brighter accent bubble
+                fmt.setFontWeight(75)
+            else:
+                fmt.setBackground(accent_soft)     # subtle tint if all done
+                fmt.setFontWeight(63)
+            cal.setDateTextFormat(qd, fmt)
 
+        # Highlight "today" with a stronger tile (without neon)
+        today = date.today()
+        if today.year == year and today.month == month:
+            qd = QDate(today.year, today.month, today.day)
+            tf = cal.dateTextFormat(qd)
+            tf.setBackground(QColor(80, 96, 150, 160))  # bluish ring effect
+            tf.setFontWeight(81)
+            cal.setDateTextFormat(qd, tf)
+
+        # Keep right pane + label in sync
         self.populate_calendar_day_list()
         self.update_calendar_selected_label()
 
@@ -450,7 +536,7 @@ class MainWindow(QWidget):
 
     def apply_accent(self, hex_color: str):
         accent = hex_color
-        # These overrides work across all themes
+        # overrides work across all themes
         self.setStyleSheet(f"""
         QLineEdit:focus, QTextEdit:focus, QListWidget:focus {{ border: 1px solid {accent}; }}
         QListWidget::item:selected {{ background: {accent}; color: white; }}
@@ -569,13 +655,42 @@ class MainWindow(QWidget):
             border-radius: 8px;
         }
 
-        /* Calendar tweaks */
-        QCalendarWidget QTableView::item:selected {
-            background: rgba(122,162,247,0.35);
+        /* Calendar tweaks (Aurora) */
+        QCalendarWidget {
+            background: transparent;
+            color: #EAF2FF;
+        }
+        QCalendarWidget QTableView {
+            background: rgba(255,255,255,0.05); /* soft slate instead of black */
+            alternate-background-color: transparent;
+            outline: 0;
+        }
+        QCalendarWidget QTableView:item {
+            padding: 6px;
         }
         QCalendarWidget QToolButton {
-            background: transparent; color: #EAF2FF; border: 0; padding: 4px 8px;
+            background: rgba(255,255,255,0.10);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 8px;
+            padding: 4px 10px;
         }
+        QCalendarWidget QToolButton:hover {
+            background: rgba(255,255,255,0.16);
+        }
+        QCalendarWidget QMenu {
+            background: rgba(20,25,45,0.98);
+            color: #EAF2FF;
+            border: 1px solid rgba(255,255,255,0.12);
+        }
+        QCalendarWidget QSpinBox, 
+        QCalendarWidget QComboBox {
+            background: rgba(255,255,255,0.10);
+            border: 1px solid rgba(255,255,255,0.15);
+            color: #EAF2FF;
+            border-radius: 6px;
+            padding: 2px 6px;
+        }
+
         """
 
     def _light_qss(self) -> str:
@@ -642,11 +757,25 @@ class MainWindow(QWidget):
         if due and not re.match(r"^\d{4}-\d{2}-\d{2}$", due):
             QMessageBox.warning(self, "Input Error", "Due date must be YYYY-MM-DD."); return
 
-        db.add_task(self.user[0], title, description, due or None)
+        # insert (allow None for due date)
+        try:
+            db.add_task(self.user[0], title, description, due or None)
+        except Exception as e:
+            QMessageBox.critical(self, "Add Task Failed", f"{e}")
+            return
+
+        # clear inputs
         self.task_input.clear()
         self.task_desc_input.clear()
         self.due_date_input.clear()
+        # reset Group and Priority inputs
+        self.group_combo.setCurrentIndex(-1)
+        self.group_combo.setEditText("")
+        if self.group_combo.lineEdit():
+            self.group_combo.lineEdit().setPlaceholderText("Group (optional)")
+        self.priority_combo.setCurrentIndex(0)
 
+        # reflect metadata for the new task
         self.refresh_tasks()
         tasks = db.get_tasks(self.user[0])
         if tasks:
@@ -658,6 +787,8 @@ class MainWindow(QWidget):
                     self.ucfg["groups"].append(group)
             _save_cfg(self.cfg)
             self.refresh_group_controls()
+            # make sure new no-date tasks are visible
+            self.status_filter.setCurrentText("All")
             self.refresh_tasks()
 
     def refresh_tasks(self):
@@ -714,13 +845,20 @@ class MainWindow(QWidget):
             prio = self.ucfg["priorities"].get(str(task_id), "low")
             picon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(prio, "🟢")
             status = "✅" if completed else "❌"
-            due_txt = ""
+
+            # --- Due date text (show something sensible if empty) ---
             if due_val:
                 try:
                     dt = datetime.strptime(due_val, "%Y-%m-%d").date()
-                    due_txt = " (Due Today!)" if dt == date.today() else f" (Due: {dt.strftime('%B %d, %Y')})"
+                    if dt == date.today():
+                        due_txt = " (Due Today!)"
+                    else:
+                        due_txt = f" (Due: {dt.strftime('%B %d, %Y')})"
                 except Exception:
                     due_txt = f" (Due: {due_val})"
+            else:
+                due_txt = " (No due date)"
+
             group_badge = f"[{group}] " if group else ""
             txt = f"{status} {picon} [{task_id}] {group_badge}{title}{due_txt}"
             self.task_list.addItem(txt)
@@ -729,6 +867,7 @@ class MainWindow(QWidget):
 
         self.refresh_user_info()
         self.refresh_calendar_marks()
+        self._update_list_actions()
 
         if prev_id is not None:
             for i in range(self.task_list.count()):
@@ -743,20 +882,27 @@ class MainWindow(QWidget):
         self.level_bar.setValue(xp % 100)
         self.update_streak_label()
 
-    def complete_task(self):
+    def _selected_task_id(self):
         item = self.task_list.currentItem()
         if not item:
+            return None
+        try:
+            return int(item.text().split("]")[0].split("[")[1])
+        except Exception:
+            return None
+
+    def complete_task(self):
+        task_id = self._selected_task_id()
+        if task_id is None:
             return
-        task_id = int(item.text().split("]")[0].split("[")[1])
         db.complete_task(task_id, self.user[0])
         self._log_completion_today()
         self.refresh_tasks()
 
     def delete_task(self):
-        item = self.task_list.currentItem()
-        if not item:
+        task_id = self._selected_task_id()
+        if task_id is None:
             return
-        task_id = int(item.text().split("]")[0].split("[")[1])
         if QMessageBox.question(self, "Delete", "Delete this task?",
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
             db.delete_task(task_id)
@@ -766,6 +912,20 @@ class MainWindow(QWidget):
                 self.ucfg["reminded"][day] = [x for x in arr if str(x) != str(task_id)]
             _save_cfg(self.cfg)
             self.refresh_tasks()
+
+    def _update_list_actions(self):
+        item = self.task_list.currentItem()
+        has = item is not None
+        self.complete_button.setEnabled(has)
+        self.delete_button.setEnabled(has)
+        if has:
+            try:
+                task_id = int(item.text().split("]")[0].split("[")[1])
+                self.sel_label.setText(f"Selected: [{task_id}]")
+            except Exception:
+                self.sel_label.setText("Selected task")
+        else:
+            self.sel_label.setText("No task selected")
 
     def show_description(self):
         item = self.task_list.currentItem()
@@ -786,13 +946,14 @@ class MainWindow(QWidget):
             return
 
         title, desc, due = row
-        due_txt = ""
         if due:
             try:
                 dt = datetime.strptime(due, "%Y-%m-%d").date()
                 due_txt = "Today" if dt == date.today() else dt.strftime("%B %d, %Y")
             except Exception:
                 due_txt = due
+        else:
+            due_txt = "No due date"
 
         prio = self.ucfg["priorities"].get(str(task_id), "low").capitalize()
         group = self.ucfg["task_groups"].get(str(task_id), "")
@@ -820,13 +981,14 @@ class MainWindow(QWidget):
         title, desc, due = row
         prio = self.ucfg["priorities"].get(str(task_id), "low").capitalize()
         group = self.ucfg["task_groups"].get(str(task_id), "")
-        due_txt = ""
         if due:
             try:
                 dt = datetime.strptime(due, "%Y-%m-%d").date()
                 due_txt = "Today" if dt == date.today() else dt.strftime("%B %d, %Y")
             except Exception:
                 due_txt = due
+        else:
+            due_txt = "No due date"
         gline = f"\nGroup: {group}" if group else ""
         content = f"Title: {title}{gline}\nPriority: {prio}"
         if due_txt:
@@ -946,7 +1108,7 @@ class MainWindow(QWidget):
 
         if to_add:
             self.ucfg.setdefault("reminded", {})
-            self.ucfg["reminded"].setdefault(today, [])
+            self.ucfg.setdefault("reminded", {}).setdefault(today, [])
             self.ucfg["reminded"][today].extend(to_add)
             _save_cfg(self.cfg)
 
@@ -1087,19 +1249,20 @@ class MainWindow(QWidget):
 
     # -------------------- Helpers --------------------
     def refresh_group_controls(self):
-        # Add-task combo
-        current = self.group_combo.currentText().strip() if hasattr(self, "group_combo") else ""
+        # Add-task combo (blank by default; don't preserve previous text)
         self.group_combo.blockSignals(True)
         self.group_combo.clear()
         for g in self.ucfg.get("groups", []):
             self.group_combo.addItem(g)
-        if current and current not in self.ucfg["groups"]:
-            self.group_combo.addItem(current)
-        if current:
-            self.group_combo.setEditText(current)
+        self.group_combo.setEditable(True)
+        self.group_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.group_combo.setCurrentIndex(-1)
+        self.group_combo.setEditText("")
+        if self.group_combo.lineEdit():
+            self.group_combo.lineEdit().setPlaceholderText("Group (optional)")
         self.group_combo.blockSignals(False)
 
-        # Filter combo
+        # Filter combo (preserve current selection)
         sel = self.group_filter.currentText() if hasattr(self, "group_filter") else "All Groups"
         self.group_filter.blockSignals(True)
         self.group_filter.clear()
@@ -1109,7 +1272,8 @@ class MainWindow(QWidget):
         idx = 0
         for i in range(self.group_filter.count()):
             if self.group_filter.itemText(i) == sel:
-                idx = i; break
+                idx = i
+                break
         self.group_filter.setCurrentIndex(idx)
         self.group_filter.blockSignals(False)
 

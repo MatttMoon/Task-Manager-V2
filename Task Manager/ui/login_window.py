@@ -77,7 +77,7 @@ class LoginWindow(QWidget):
 
         self.signup_button = QPushButton("Sign Up")
         self.signup_button.clicked.connect(self.open_signup)
-        # --- commit change ---
+        
         # --- Layout ---
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
