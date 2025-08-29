@@ -11,61 +11,10 @@ from datetime import datetime, date, timedelta
 from db import database as db
 import re, json, os
 
+from core.config import load_cfg, save_cfg, user_bucket
+
 # -------------------- Config (global + per-user) --------------------
 CONFIG_FILE = "app_settings.json"
-
-GLOBAL_DEFAULTS = {
-    "theme": "aurora",
-    "accent": "#7AA2F7",
-    "users": {}  # per-user buckets live here
-}
-
-USER_DEFAULTS = {
-    "groups": [],           # ["Computer", "Business", ...]
-    "task_groups": {},      # {task_id: "GroupName"}
-    "priorities": {},       # {task_id: "low|medium|high"}
-    "completion_log": [],   # ["YYYY-MM-DD", ...]
-    "reminded": {}          # {"YYYY-MM-DD": [task_id, ...]}
-}
-
-def _load_cfg():
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-                # backfill missing global keys
-                for k, v in GLOBAL_DEFAULTS.items():
-                    if k == "users":
-                        data.setdefault("users", {})
-                    else:
-                        data.setdefault(k, v)
-                return data
-    except Exception:
-        pass
-    _save_cfg(GLOBAL_DEFAULTS)
-    # deep copy
-    return json.loads(json.dumps(GLOBAL_DEFAULTS))
-
-def _save_cfg(cfg: dict):
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception as e:
-        print("Error saving config:", e)
-
-def _user_bucket(cfg: dict, user_id: int) -> dict:
-    """Ensure a per-user bucket exists and is backfilled; return it."""
-    ukey = str(user_id)
-    if "users" not in cfg:
-        cfg["users"] = {}
-    if ukey not in cfg["users"]:
-        cfg["users"][ukey] = json.loads(json.dumps(USER_DEFAULTS))  # deep copy
-        _save_cfg(cfg)
-    else:
-        # backfill after updates
-        for k, v in USER_DEFAULTS.items():
-            cfg["users"][ukey].setdefault(k, json.loads(json.dumps(v)))
-    return cfg["users"][ukey]
 
 # -------------------- Small helpers --------------------
 def _today_iso() -> str:
@@ -80,8 +29,8 @@ class MainWindow(QWidget):
         self.resize(1000, 700)
 
         # settings
-        self.cfg = _load_cfg()                  # global (theme/accent)
-        self.ucfg = _user_bucket(self.cfg, self.user[0])  # per-user bucket
+        self.cfg = load_cfg()                  # global (theme/accent)
+        self.ucfg = user_bucket(self.cfg, self.user[0])  # per-user bucket
 
         # --- one-time migration from old global keys (if present) ---
         _legacy = ("groups","task_groups","priorities","completion_log","reminded")
@@ -91,7 +40,7 @@ class MainWindow(QWidget):
                 self.ucfg[k] = self.cfg.pop(k)
                 migrated = True
         if migrated:
-            _save_cfg(self.cfg)
+            save_cfg(self.cfg)
         # ------------------------------------------------------------
 
         # layout
@@ -502,7 +451,7 @@ class MainWindow(QWidget):
     def on_theme_changed(self, text: str):
         theme = text.lower()
         self.cfg["theme"] = theme
-        _save_cfg(self.cfg)
+        save_cfg(self.cfg)
         self.apply_theme(theme)
         self.apply_accent(self.cfg.get("accent", "#7AA2F7"))
         self._apply_aurora_effects_if_needed()
@@ -518,7 +467,7 @@ class MainWindow(QWidget):
             else:
                 return
         self.cfg["accent"] = color
-        _save_cfg(self.cfg)
+        save_cfg(self.cfg)
         self.apply_accent(color)
         self.refresh_calendar_marks()
 
@@ -785,7 +734,7 @@ class MainWindow(QWidget):
                 self.ucfg["task_groups"][str(new_task_id)] = group
                 if group not in self.ucfg["groups"]:
                     self.ucfg["groups"].append(group)
-            _save_cfg(self.cfg)
+            save_cfg(self.cfg)
             self.refresh_group_controls()
             # make sure new no-date tasks are visible
             self.status_filter.setCurrentText("All")
@@ -910,7 +859,7 @@ class MainWindow(QWidget):
             self.ucfg["task_groups"].pop(str(task_id), None)
             for day, arr in list(self.ucfg.get("reminded", {}).items()):
                 self.ucfg["reminded"][day] = [x for x in arr if str(x) != str(task_id)]
-            _save_cfg(self.cfg)
+            save_cfg(self.cfg)
             self.refresh_tasks()
 
     def _update_list_actions(self):
@@ -1077,7 +1026,7 @@ class MainWindow(QWidget):
                     self.ucfg["task_groups"][str(new_id)] = group_name
             if group_name and group_name not in self.ucfg["groups"]:
                 self.ucfg["groups"].append(group_name)
-            _save_cfg(self.cfg)
+            save_cfg(self.cfg)
             self.refresh_group_controls()
             self.refresh_tasks()
             QMessageBox.information(self, "Bulk Add", f"Added {imported} tasks to group '{group_name or 'No Group'}'.")
@@ -1110,7 +1059,7 @@ class MainWindow(QWidget):
             self.ucfg.setdefault("reminded", {})
             self.ucfg.setdefault("reminded", {}).setdefault(today, [])
             self.ucfg["reminded"][today].extend(to_add)
-            _save_cfg(self.cfg)
+            save_cfg(self.cfg)
 
     def _log_completion_today(self):
         today = _today_iso()
@@ -1118,7 +1067,7 @@ class MainWindow(QWidget):
         if today not in logs:
             logs.append(today)
             self.ucfg["completion_log"] = logs
-            _save_cfg(self.cfg)
+            save_cfg(self.cfg)
 
     def update_streak_label(self):
         logs = sorted(set(self.ucfg.get("completion_log", [])))
@@ -1218,7 +1167,7 @@ class MainWindow(QWidget):
                 if g and g not in self.ucfg["groups"]:
                     self.ucfg["groups"].append(g)
 
-            _save_cfg(self.cfg)
+            save_cfg(self.cfg)
             self.refresh_group_controls()
             self.refresh_tasks()
             QMessageBox.information(self, "Import", f"Imported {imported} tasks.")

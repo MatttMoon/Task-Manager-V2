@@ -21,6 +21,9 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="core\config.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="db\database.py" />
     <Compile Include="main.py" />
     <Compile Include="mic_diag.py">
@@ -36,6 +39,7 @@
     <Folder Include="assets\images\" />
     <Folder Include="db\" />
     <Folder Include="assets\" />
+    <Folder Include="core\" />
     <Folder Include="ui\" />
   </ItemGroup>
   <ItemGroup>
