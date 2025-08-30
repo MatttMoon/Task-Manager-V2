@@ -2,11 +2,11 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLabel, QLineEdit, QTextEdit,
     QListWidget, QMessageBox, QTabWidget, QHBoxLayout, QApplication, QComboBox,
-    QFileDialog, QProgressBar, QCalendarWidget, QSplitter, QDialog, QPlainTextEdit,
-    QGraphicsDropShadowEffect, QMenu
+    QFileDialog, QProgressBar, QDialog, QPlainTextEdit, QMenu
 )
+
 from PyQt5.QtCore import Qt, QTimer, QDate
-from PyQt5.QtGui import QColor, QTextCharFormat
+from PyQt5.QtGui import QColor
 from datetime import datetime, date, timedelta
 from db import database as db
 import re, json, os
@@ -15,7 +15,16 @@ from core.config import load_cfg, save_cfg, user_bucket
 from core.theme import (
     apply_theme_to_app,
     apply_accent_to_window,
-    apply_aurora_effects_if_needed,
+    apply_aurora_effects_if_needed, reapply_theme
+)
+from ui.calendar_tab import (
+    init_calendar_tab,
+    toggle_calendar_panel,
+    on_calendar_selection_changed,
+    on_calendar_date_changed,
+    update_calendar_selected_label,
+    populate_calendar_day_list,
+    refresh_calendar_marks,
 )
 
 
@@ -54,17 +63,17 @@ class MainWindow(QWidget):
         root = QVBoxLayout(self)
         root.addWidget(self.tabs)
         self.init_task_tab()
-        self.init_calendar_tab()
+        init_calendar_tab(self)
         self.init_settings_tab()
 
-        apply_theme_to_app(self.cfg.get("theme", "aurora"))
-        apply_accent_to_window(self, self.cfg.get("accent", "#7AA2F7"))
+        reapply_theme(self, self.cfg.get("theme", "aurora"), self.cfg.get("accent", "#7AA2F7"))
         apply_aurora_effects_if_needed(self, self.cfg)
-
-
+                
         # initial data
         self.refresh_group_controls()
         self.refresh_tasks()
+        refresh_calendar_marks(self)
+
 
         # reminders
         self.reminder_timer = QTimer(self)
@@ -244,168 +253,7 @@ class MainWindow(QWidget):
 
         self.tabs.addTab(tab, "Tasks")
 
-    # -------------------- Calendar tab --------------------
-    def init_calendar_tab(self):
-        tab = QWidget()
-        v = QVBoxLayout(tab)
-
-        top = QHBoxLayout()
-        self.cal_toggle_btn = QPushButton("Hide Calendar")
-        self.cal_toggle_btn.clicked.connect(self.toggle_calendar_panel)
-        self.cal_selected_label = QLabel("Selected: Today")
-        top.addWidget(self.cal_toggle_btn)
-        top.addStretch(1)
-        top.addWidget(self.cal_selected_label)
-        v.addLayout(top)
-
-        self.cal_splitter = QSplitter(Qt.Horizontal)
-        self.calendar = QCalendarWidget()
-        self.calendar.setGridVisible(True)
-        self.calendar.clicked.connect(self.on_calendar_date_changed)
-        self.calendar.selectionChanged.connect(self.on_calendar_selection_changed)
-        self.calendar.currentPageChanged.connect(lambda *_: self.refresh_calendar_marks())
-
-        right_box = QWidget()
-        right_layout = QVBoxLayout(right_box)
-        right_layout.addWidget(QLabel("Tasks on this date:"))
-        self.cal_tasks_list = QListWidget()
-        right_layout.addWidget(self.cal_tasks_list, 1)
-
-        self.cal_splitter.addWidget(self.calendar)
-        self.cal_splitter.addWidget(right_box)
-        self.cal_splitter.setStretchFactor(0, 0)
-        self.cal_splitter.setStretchFactor(1, 1)
-
-        v.addWidget(self.cal_splitter, 1)
-
-        self.tabs.addTab(tab, "Calendar")
-
-    def toggle_calendar_panel(self):
-        if self.calendar.isVisible():
-            self.calendar.setVisible(False)
-            self.cal_toggle_btn.setText("Show Calendar")
-        else:
-            self.calendar.setVisible(True)
-            self.cal_toggle_btn.setText("Hide Calendar")
-
-    def on_calendar_selection_changed(self):
-        self.update_calendar_selected_label()
-        self.populate_calendar_day_list()
-
-    def on_calendar_date_changed(self, qdate: QDate):
-        self.update_calendar_selected_label(qdate)
-        self.populate_calendar_day_list()
-
-    def update_calendar_selected_label(self, qdate: QDate = None):
-        qd = qdate if qdate is not None else self.calendar.selectedDate()
-        py = date(qd.year(), qd.month(), qd.day())
-        if py == date.today():
-            self.cal_selected_label.setText("Selected: Today")
-        else:
-            self.cal_selected_label.setText("Selected: " + py.strftime("%A, %B %d, %Y"))
-
-    def populate_calendar_day_list(self):
-        self.cal_tasks_list.clear()
-        qd = self.calendar.selectedDate()
-        day_iso = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
-
-        tasks_on_day = [t for t in db.get_tasks(self.user[0]) if t[5] == day_iso]
-        if not tasks_on_day:
-            self.cal_tasks_list.addItem("No tasks due.")
-            return
-
-        for t in tasks_on_day:
-            task_id = t[0]
-            title = t[2]
-            completed = bool(t[4])
-            group = self.ucfg["task_groups"].get(str(task_id), "")
-            group_badge = f"[{group}] " if group else ""
-            prio = self.ucfg["priorities"].get(str(task_id), "low")
-            picon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(prio, "🟢")
-            status = "✅" if completed else "❌"
-            self.cal_tasks_list.addItem(f"{status} {picon} [{task_id}] {group_badge}{title}")
-
-    def refresh_calendar_marks(self):
-        cal = self.calendar
-
-        # Palette
-        accent_hex = self.cfg.get("accent", "#7AA2F7")
-        accent = QColor(accent_hex)
-        accent_soft = QColor(accent)
-        accent_soft.setAlphaF(0.22)
-        accent_strong = QColor(accent)
-        accent_strong.setAlphaF(0.38)
-
-        slate = QColor(34, 42, 64, int(255*0.60))   # default tile for in-month
-        slate_dim = QColor(34, 42, 64, int(255*0.28))  # out-of-month
-        text_main = QColor("#EAF2FF")
-        text_dim  = QColor(200, 210, 230, 160)
-
-        # Clear formats for the visible month to soft slate (not black)
-        year, month = cal.yearShown(), cal.monthShown()
-        first = QDate(year, month, 1)
-        days = first.daysInMonth()
-
-        base_fmt = QTextCharFormat()
-        base_fmt.setBackground(slate)
-        base_fmt.setForeground(text_main)
-
-        for d in range(1, days + 1):
-            cal.setDateTextFormat(QDate(year, month, d), base_fmt)
-
-            
-        # Iterate a bit around the month range to catch neighbors.
-        for delta in (-7, -6, -5, -4, -3, -2, -1, days+1, days+2, days+3, days+4, days+5, days+6, days+7):
-            qd = first.addDays(delta)
-            fmt = QTextCharFormat()
-            fmt.setBackground(slate_dim)
-            fmt.setForeground(text_dim)
-            cal.setDateTextFormat(qd, fmt)
-
-        # Build marks: any task on date, and if any are incomplete
-        marks = {}  # QDate -> (any, has_incomplete)
-        for t in db.get_tasks(self.user[0]):
-            d = t[5]
-            if not d:
-                continue
-            try:
-                dt = datetime.strptime(d, "%Y-%m-%d").date()
-            except Exception:
-                continue
-            qd = QDate(dt.year, dt.month, dt.day)
-            any_in_month = (dt.year == year and dt.month == month)
-            if not any_in_month:
-                continue
-            completed = bool(t[4])
-            prev_any, prev_incomp = marks.get(qd, (False, False))
-            marks[qd] = (True, prev_incomp or (not completed))
-
-        # Apply accent for days with tasks
-        for qd, (_any, has_incomplete) in marks.items():
-            fmt = QTextCharFormat()
-            fmt.setForeground(text_main)
-            if has_incomplete:
-                fmt.setBackground(accent_strong)   # brighter accent bubble
-                fmt.setFontWeight(75)
-            else:
-                fmt.setBackground(accent_soft)     # subtle tint if all done
-                fmt.setFontWeight(63)
-            cal.setDateTextFormat(qd, fmt)
-
-        # Highlight "today" with a stronger tile (without neon)
-        today = date.today()
-        if today.year == year and today.month == month:
-            qd = QDate(today.year, today.month, today.day)
-            tf = cal.dateTextFormat(qd)
-            tf.setBackground(QColor(80, 96, 150, 160))  # bluish ring effect
-            tf.setFontWeight(81)
-            cal.setDateTextFormat(qd, tf)
-
-        # Keep right pane + label in sync
-        self.populate_calendar_day_list()
-        self.update_calendar_selected_label()
-
-    # -------------------- Settings tab --------------------
+       # -------------------- Settings tab --------------------
     def init_settings_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -458,10 +306,12 @@ class MainWindow(QWidget):
         theme = text.lower()
         self.cfg["theme"] = theme
         save_cfg(self.cfg)
-        apply_theme_to_app(theme)
-        apply_accent_to_window(self, self.cfg.get("accent", "#7AA2F7"))
+
+    # one call updates global QSS, remembers theme+accent, and repaints calendar
+        reapply_theme(self, theme, self.cfg.get("accent", "#7AA2F7"))
+
+    # keep your aurora glow if that theme is active
         apply_aurora_effects_if_needed(self, self.cfg)
-        self.refresh_calendar_marks()
 
 
     def on_accent_changed(self, text: str):
@@ -469,14 +319,17 @@ class MainWindow(QWidget):
         if text == "Custom…":
             from PyQt5.QtWidgets import QColorDialog
             chosen = QColorDialog.getColor(QColor(self.cfg.get("accent", "#7AA2F7")), self, "Pick Accent Color")
-            if chosen.isValid():
-                color = chosen.name()
-            else:
+            if not chosen.isValid():
                 return
+            color = chosen.name()
+
         self.cfg["accent"] = color
         save_cfg(self.cfg)
-        apply_accent_to_window(self, color)
-        self.refresh_calendar_marks()
+
+        # re-theme with the new accent (keeps current theme)
+        reapply_theme(self, self.cfg.get("theme", "aurora"), color)
+
+        apply_aurora_effects_if_needed(self, self.cfg)
 
 
     # -------------------- CRUD --------------------
@@ -605,7 +458,7 @@ class MainWindow(QWidget):
                 self.task_list.item(self.task_list.count() - 1).setForeground(Qt.red)
 
         self.refresh_user_info()
-        self.refresh_calendar_marks()
+        refresh_calendar_marks(self)
         self._update_list_actions()
 
         if prev_id is not None:
@@ -846,10 +699,10 @@ class MainWindow(QWidget):
                 to_add.append(task_id)
 
         if to_add:
-            self.ucfg.setdefault("reminded", {})
             self.ucfg.setdefault("reminded", {}).setdefault(today, [])
             self.ucfg["reminded"][today].extend(to_add)
             save_cfg(self.cfg)
+
 
     def _log_completion_today(self):
         today = _today_iso()
@@ -974,7 +827,7 @@ class MainWindow(QWidget):
             cur.execute("UPDATE users SET xp = 0 WHERE id=?", (self.user[0],))
             conn.commit(); conn.close()
             self.refresh_user_info()
-            self.refresh_calendar_marks()
+            refresh_calendar_marks(self)
 
     def clear_all_tasks(self):
         if QMessageBox.question(

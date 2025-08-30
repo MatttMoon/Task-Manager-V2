@@ -1,6 +1,6 @@
 {
   "mic_device_index": 1,
-  "theme": "aurora",
+  "theme": "dark",
   "accent": "#9c27b0",
   "priorities": {
     "9": "high",
@@ -40,22 +40,16 @@
         "sdfasdf"
       ],
       "task_groups": {
-        "37": "Math",
-        "38": "Math",
-        "39": "Math"
+        "38": "Math"
       },
-      "priorities": {
-        "34": "low"
-      },
+      "priorities": {},
       "completion_log": [
         "2025-08-22",
         "2025-08-29"
       ],
       "reminded": {
         "2025-08-22": [],
-        "2025-08-29": [
-          "34"
-        ]
+        "2025-08-29": []
       }
     },
     "5": {

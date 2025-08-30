@@ -32,6 +32,9 @@
     <Compile Include="mic_diag.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="ui\calendar_tab.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="ui\login_window.py" />
     <Compile Include="ui\main_window.py" />
     <Compile Include="ui\signup_window.py" />
