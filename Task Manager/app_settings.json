@@ -42,7 +42,9 @@
       "task_groups": {
         "38": "Math"
       },
-      "priorities": {},
+      "priorities": {
+        "40": "low"
+      },
       "completion_log": [
         "2025-08-22",
         "2025-08-29"

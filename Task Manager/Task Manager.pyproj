@@ -24,6 +24,9 @@
     <Compile Include="core\config.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="core\models.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="core\theme.py">
       <SubType>Code</SubType>
     </Compile>

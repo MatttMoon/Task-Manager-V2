@@ -7,6 +7,8 @@ from PyQt5.QtCore import Qt, QDate
 from PyQt5.QtGui import QTextCharFormat, QColor, QFont
 from datetime import datetime, date
 from db import database as db
+from core.models import Task, task_from_row
+
 
 
 # -------------------- Build tab --------------------
@@ -92,11 +94,20 @@ def update_calendar_selected_label(window, qdate: QDate = None):
 
 
 # -------------------- Data helpers --------------------
-def _safe_tasks(window):
+def _load_tasks(window) -> list[Task]:
+    """Read tasks from DB and return Task objects (safe on errors)."""
     try:
-        return db.get_tasks(window.user[0]) or []
+        rows = db.get_tasks(window.user[0]) or []
     except Exception:
         return []
+    tasks: list[Task] = []
+    for r in rows:
+        try:
+            tasks.append(task_from_row(r))
+        except Exception:
+            continue
+    return tasks
+
 
 
 def _user_cfg(window):
@@ -107,42 +118,28 @@ def _user_cfg(window):
 def populate_calendar_day_list(window):
     window.cal_tasks_list.clear()
     qd = window.calendar.selectedDate()
-    day_iso = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
+    py_day = date(qd.year(), qd.month(), qd.day())
 
-    tasks_on_day = []
-    for t in _safe_tasks(window):
-        # schema: (id, user_id, title, description, completed, due_date, ...)
-        try:
-            due = t[5]
-        except Exception:
-            continue
-        if due == day_iso:
-            tasks_on_day.append(t)
+    # tasks for the selected day
+    tasks_today = [t for t in _load_tasks(window) if t.due_date == py_day]
 
-    if not tasks_on_day:
+    if not tasks_today:
         window.cal_tasks_list.addItem("No tasks due.")
         return
 
     ucfg = _user_cfg(window)
-    tgroups = ucfg.get("task_groups", {}) or {}
-    pris = ucfg.get("priorities", {}) or {}
+    tgroups = (ucfg.get("task_groups") or {}) if isinstance(ucfg, dict) else {}
+    pris    = (ucfg.get("priorities")  or {}) if isinstance(ucfg, dict) else {}
 
-    for t in tasks_on_day:
-        try:
-            task_id = t[0]
-            title = t[2]
-            completed = bool(t[4])
-        except Exception:
-            continue
-
-        group = tgroups.get(str(task_id), "")
+    for t in tasks_today:
+        group = tgroups.get(str(t.id), "")
         group_badge = f"[{group}] " if group else ""
 
-        prio = (pris.get(str(task_id)) or "low").lower()
+        prio = (pris.get(str(t.id)) or "low").lower()
         picon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(prio, "🟢")
 
-        status = "✅" if completed else "❌"
-        window.cal_tasks_list.addItem(f"{status} {picon} [{task_id}] {group_badge}{title}")
+        status = "✅" if t.completed else "❌"
+        window.cal_tasks_list.addItem(f"{status} {picon} [{t.id}] {group_badge}{t.title}")
 
 
 # -------------------- Calendar marking --------------------
@@ -201,6 +198,28 @@ def refresh_calendar_marks(window):
         cal.setDateTextFormat(qd, tf)
 
     # due-date cue (text-only; no backgrounds)
+        # due-date cue (text-only; no backgrounds) — now using Task objects
+    accent_hex = (getattr(window, "cfg", {}) or {}).get("accent", "#7AA2F7")
+    accent_fg  = QColor(accent_hex)
+
+    marks: dict[QDate, bool] = {}  # QDate -> any incomplete on that day?
+
+    for t in _load_tasks(window):
+        dt = t.due_date
+        if not dt or dt.year != year or dt.month != month:
+            continue
+        qd = QDate(dt.year, dt.month, dt.day)
+        # mark true if ANY task on that date is incomplete
+        marks[qd] = marks.get(qd, False) or (not t.completed)
+
+    for qd, has_incomplete in marks.items():
+        ff = cal.dateTextFormat(qd)
+        if has_incomplete:
+            ff.setFontWeight(QFont.DemiBold)
+            ff.setForeground(accent_fg)
+        else:
+            ff.setFontWeight(QFont.Normal)
+        cal.setDateTextFormat(qd, ff)
     accent_hex = (getattr(window, "cfg", {}) or {}).get("accent", "#7AA2F7")
     accent_fg  = QColor(accent_hex)
     marks = {}
