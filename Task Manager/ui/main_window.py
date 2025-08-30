@@ -1,7 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QPushButton, QLabel, QLineEdit, QTextEdit,
-    QListWidget, QMessageBox, QTabWidget, QHBoxLayout, QApplication, QComboBox,
+    QWidget, QVBoxLayout, QPushButton, QLabel, QLineEdit, QTextEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QTabWidget, QHBoxLayout, QApplication, QComboBox,
     QFileDialog, QProgressBar, QDialog, QPlainTextEdit, QMenu
 )
 
@@ -26,6 +26,7 @@ from ui.calendar_tab import (
     populate_calendar_day_list,
     refresh_calendar_marks,
 )
+from core.models import Task, task_from_row
 
 
 # -------------------- Config (global + per-user) --------------------
@@ -307,11 +308,11 @@ class MainWindow(QWidget):
         self.cfg["theme"] = theme
         save_cfg(self.cfg)
 
-    # one call updates global QSS, remembers theme+accent, and repaints calendar
+        # one call updates global QSS, remembers theme+accent, and repaints calendar
         reapply_theme(self, theme, self.cfg.get("accent", "#7AA2F7"))
-
-    # keep your aurora glow if that theme is active
+        # keep your aurora glow if that theme is active
         apply_aurora_effects_if_needed(self, self.cfg)
+
 
 
     def on_accent_changed(self, text: str):
@@ -368,10 +369,11 @@ class MainWindow(QWidget):
         self.priority_combo.setCurrentIndex(0)
 
         # reflect metadata for the new task
+        # reflect metadata for the new task
         self.refresh_tasks()
-        tasks = db.get_tasks(self.user[0])
-        if tasks:
-            new_task_id = tasks[-1][0]
+        new_ids = self._fetch_last_task_ids(1)
+        if new_ids:
+            new_task_id = new_ids[0]
             self.ucfg["priorities"][str(new_task_id)] = prio
             if group:
                 self.ucfg["task_groups"][str(new_task_id)] = group
@@ -383,89 +385,26 @@ class MainWindow(QWidget):
             self.status_filter.setCurrentText("All")
             self.refresh_tasks()
 
+
+    
     def refresh_tasks(self):
-        prev_id = None
-        item = getattr(self, "task_list", None)
-        if item and item.currentItem():
-            try:
-                prev_id = int(item.currentItem().text().split("]")[0].split("[")[1])
-            except Exception:
-                prev_id = None
-
         self.task_list.clear()
-        query = self.search_input.text().strip().lower() if hasattr(self, "search_input") else ""
-        filter_mode = self.status_filter.currentText() if hasattr(self, "status_filter") else "All"
-        gfilter = self.group_filter.currentText() if hasattr(self, "group_filter") else "All Groups"
+        tasks = self._safe_tasks()
+        if not tasks:
+            self.task_list.addItem("No tasks yet.")
+            return
+        tasks.sort(key=lambda t: (t.due_date or date.max, t.title.lower()))
+        for t in tasks:
+            due_str = t.due_date.isoformat() if t.due_date else ""
+            status = "✅" if t.completed else "❌"
+            text = f"{status} [{t.id}] {t.title}"
+            if due_str:
+                text += f"  —  {due_str}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, t.id)   
+            self.task_list.addItem(item)
 
-        for task in db.get_tasks(self.user[0]):
-            # task[0]=id, task[2]=title, task[4]=completed, task[5]=due_date
-            task_id = task[0]
-            title = task[2]
-            completed = bool(task[4])
-            due_val = task[5]
 
-            # description for search
-            conn = db.get_connection(); cur = conn.cursor()
-            cur.execute("SELECT description FROM tasks WHERE id=?", (task_id,))
-            rr = cur.fetchone()
-            conn.close()
-            desc = (rr[0] if rr else "") or ""
-
-            group = self.ucfg["task_groups"].get(str(task_id), "")
-
-            # Filters
-            if gfilter != "All Groups" and group != gfilter:
-                continue
-            if query:
-                hay = f"{title}\n{desc}".lower()
-                if query not in hay:
-                    continue
-            if filter_mode == "Completed" and not completed:
-                continue
-            if filter_mode == "Not Completed" and completed:
-                continue
-            if filter_mode == "Due Today":
-                if not due_val:
-                    continue
-                try:
-                    dt = datetime.strptime(due_val, "%Y-%m-%d").date()
-                    if dt != date.today():
-                        continue
-                except Exception:
-                    continue
-
-            prio = self.ucfg["priorities"].get(str(task_id), "low")
-            picon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(prio, "🟢")
-            status = "✅" if completed else "❌"
-
-            # --- Due date text (show something sensible if empty) ---
-            if due_val:
-                try:
-                    dt = datetime.strptime(due_val, "%Y-%m-%d").date()
-                    if dt == date.today():
-                        due_txt = " (Due Today!)"
-                    else:
-                        due_txt = f" (Due: {dt.strftime('%B %d, %Y')})"
-                except Exception:
-                    due_txt = f" (Due: {due_val})"
-            else:
-                due_txt = " (No due date)"
-
-            group_badge = f"[{group}] " if group else ""
-            txt = f"{status} {picon} [{task_id}] {group_badge}{title}{due_txt}"
-            self.task_list.addItem(txt)
-            if "Due Today!" in due_txt and not completed:
-                self.task_list.item(self.task_list.count() - 1).setForeground(Qt.red)
-
-        self.refresh_user_info()
-        refresh_calendar_marks(self)
-        self._update_list_actions()
-
-        if prev_id is not None:
-            for i in range(self.task_list.count()):
-                if f"[{prev_id}]" in self.task_list.item(i).text():
-                    self.task_list.setCurrentRow(i)
-                    break
 
     def refresh_user_info(self):
         xp = db.get_user_xp(self.user[0])
@@ -476,12 +415,8 @@ class MainWindow(QWidget):
 
     def _selected_task_id(self):
         item = self.task_list.currentItem()
-        if not item:
-            return None
-        try:
-            return int(item.text().split("]")[0].split("[")[1])
-        except Exception:
-            return None
+        return item.data(Qt.UserRole) if item else None
+
 
     def complete_task(self):
         task_id = self._selected_task_id()
@@ -510,23 +445,16 @@ class MainWindow(QWidget):
         has = item is not None
         self.complete_button.setEnabled(has)
         self.delete_button.setEnabled(has)
-        if has:
-            try:
-                task_id = int(item.text().split("]")[0].split("[")[1])
-                self.sel_label.setText(f"Selected: [{task_id}]")
-            except Exception:
-                self.sel_label.setText("Selected task")
-        else:
-            self.sel_label.setText("No task selected")
+        self.sel_label.setText(f"Selected: [{item.data(Qt.UserRole)}]" if has else "No task selected")
+
 
     def show_description(self):
         item = self.task_list.currentItem()
         if not item:
             self.task_details.setPlainText("Select a task to see its description.")
             return
-        try:
-            task_id = int(item.text().split("]")[0].split("[")[1])
-        except Exception:
+        task_id = item.data(Qt.UserRole)
+        if task_id is None:
             self.task_details.setPlainText("Select a task to see its description.")
             return
 
@@ -560,9 +488,8 @@ class MainWindow(QWidget):
         item = self.task_list.currentItem()
         if not item:
             return
-        try:
-            task_id = int(item.text().split("]")[0].split("[")[1])
-        except Exception:
+        task_id = item.data(Qt.UserRole)
+        if task_id is None:
             return
 
         conn = db.get_connection(); cur = conn.cursor()
@@ -570,6 +497,7 @@ class MainWindow(QWidget):
         row = cur.fetchone(); conn.close()
         if not row:
             return
+
         title, desc, due = row
         prio = self.ucfg["priorities"].get(str(task_id), "low").capitalize()
         group = self.ucfg["task_groups"].get(str(task_id), "")
@@ -581,6 +509,7 @@ class MainWindow(QWidget):
                 due_txt = due
         else:
             due_txt = "No due date"
+
         gline = f"\nGroup: {group}" if group else ""
         content = f"Title: {title}{gline}\nPriority: {prio}"
         if due_txt:
@@ -598,6 +527,33 @@ class MainWindow(QWidget):
         btn_close.clicked.connect(dlg.close)
         dlg.resize(520, 400)
         dlg.exec_()
+
+    def _fetch_last_task_ids(self, n: int) -> list[int]:
+        """Return the last n task ids for this user, newest first."""
+        conn = db.get_connection(); cur = conn.cursor()
+        cur.execute("SELECT id FROM tasks WHERE user_id=? ORDER BY id DESC LIMIT ?", (self.user[0], n))
+        ids = [r[0] for r in cur.fetchall()]
+        conn.close()
+        return ids
+
+
+    def _safe_tasks(self) -> list[Task]:
+        """Return Task models for the current user, regardless of DB return type."""
+        try:
+            rows_or_models = db.get_tasks(self.user[0]) or []
+        except Exception:
+            return []
+
+        tasks: list[Task] = []
+        for r in rows_or_models:
+            if isinstance(r, Task):
+                tasks.append(r)
+            else:
+                try:
+                    tasks.append(task_from_row(r))
+                except Exception:
+                    continue
+        return tasks
 
     # -------------------- Bulk Add --------------------
     def bulk_add_tasks(self):
@@ -657,22 +613,35 @@ class MainWindow(QWidget):
         titles = [ln.strip() for ln in titles_edit.toPlainText().splitlines() if ln.strip()]
 
         imported = 0
+        # Initialize variables here
+        sanitized = []
+        groups_from_file = set(self.ucfg.get("groups", []))
+
         for title in titles:
-            db.add_task(self.user[0], title, "", due_str or None)
+            sanitized.append((title, "", due_str, "low", group_name))
+
+        for title, desc, due, prio, grp in sanitized:
+            db.add_task(self.user[0], title, desc, due)
             imported += 1
 
         if imported:
-            tasks_now = db.get_tasks(self.user[0])
-            new_ids = [x[0] for x in tasks_now[-imported:]]
-            for new_id in new_ids:
-                if group_name:
-                    self.ucfg["task_groups"][str(new_id)] = group_name
-            if group_name and group_name not in self.ucfg["groups"]:
-                self.ucfg["groups"].append(group_name)
+            # Use _fetch_last_task_ids to grab the new task ids
+            new_ids = self._fetch_last_task_ids(imported)
+            for new_id, (title, desc, due, prio, grp) in zip(new_ids, sanitized):
+                self.ucfg["priorities"][str(new_id)] = prio
+                if grp:
+                    self.ucfg["task_groups"][str(new_id)] = grp
+                    groups_from_file.add(grp)
+
+            for g in groups_from_file:
+                if g and g not in self.ucfg["groups"]:
+                    self.ucfg["groups"].append(g)
+
             save_cfg(self.cfg)
             self.refresh_group_controls()
             self.refresh_tasks()
             QMessageBox.information(self, "Bulk Add", f"Added {imported} tasks to group '{group_name or 'No Group'}'.")
+
 
     # -------------------- Reminders & Streak --------------------
     def check_due_reminders(self):
@@ -680,23 +649,15 @@ class MainWindow(QWidget):
         reminded_today = set(map(str, self.ucfg.get("reminded", {}).get(today, [])))
         to_add = []
 
-        for task in db.get_tasks(self.user[0]):
-            task_id = str(task[0])
-            completed = bool(task[4])
-            due = task[5]
-            if completed or not due:
+        for t in self._safe_tasks():
+            if t.completed or not t.due_date:
                 continue
-            try:
-                dt = datetime.strptime(due, "%Y-%m-%d").date()
-            except Exception:
-                continue
-
-            if dt == date.today() and task_id not in reminded_today:
-                title = task[2]
-                group = self.ucfg["task_groups"].get(task_id, "")
+            if t.due_date == date.today() and str(t.id) not in reminded_today:
+                title = t.title
+                group = self.ucfg["task_groups"].get(str(t.id), "")
                 gtxt = f" [{group}]" if group else ""
                 QMessageBox.information(self, "Reminder", f"⚠️ '{title}'{gtxt} is due today.")
-                to_add.append(task_id)
+                to_add.append(str(t.id))
 
         if to_add:
             self.ucfg.setdefault("reminded", {}).setdefault(today, [])
@@ -730,22 +691,21 @@ class MainWindow(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Export Tasks", "tasks_export.json", "JSON Files (*.json)")
         if not path:
             return
+
         tasks_out = []
-        for task in db.get_tasks(self.user[0]):
-            task_id = task[0]
+        for t in self._safe_tasks():
             conn = db.get_connection(); cur = conn.cursor()
-            cur.execute("SELECT description FROM tasks WHERE id=?", (task_id,))
-            rr = cur.fetchone()
-            conn.close()
+            cur.execute("SELECT description FROM tasks WHERE id=?", (t.id,))
+            rr = cur.fetchone(); conn.close()
             desc = (rr[0] if rr else "") or ""
             tasks_out.append({
-                "id": task_id,
-                "title": task[2],
+                "id": t.id,
+                "title": t.title,
                 "description": desc,
-                "completed": bool(task[4]),
-                "due_date": task[5],
-                "priority": self.ucfg["priorities"].get(str(task_id), "low"),
-                "group": self.ucfg["task_groups"].get(str(task_id), "")
+                "completed": bool(t.completed),
+                "due_date": t.due_date.isoformat() if t.due_date else None,
+                "priority": self.ucfg["priorities"].get(str(t.id), "low"),
+                "group": self.ucfg["task_groups"].get(str(t.id), "")
             })
 
         data = {
@@ -760,6 +720,7 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "Export", "Tasks exported successfully.")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", f"Failed to export tasks:\n{e}")
+
 
     def import_tasks(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import Tasks", "", "JSON Files (*.json)")
