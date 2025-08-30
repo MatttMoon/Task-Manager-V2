@@ -1,6 +1,7 @@
 ﻿# db.py
 import sqlite3
-from datetime import datetime
+from typing import List
+from core.models import Task, task_from_row
 
 DB_FILE = "tasks.db"
 
@@ -70,16 +71,16 @@ def add_task(user_id, title, description, due_date):
     conn.commit()
     conn.close()
 
-def get_tasks(user_id):
-    conn = get_connection()
+def get_tasks(user_id: int) -> List[Task]:
+    conn = sqlite3.connect("tasks.db")
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, user_id, title, description, completed, due_date FROM tasks WHERE user_id = ? ORDER BY due_date, id",
+        "SELECT id, user_id, title, description, completed, due_date FROM tasks WHERE user_id = ?",
         (user_id,)
     )
-    tasks = cur.fetchall()
+    rows = cur.fetchall()
     conn.close()
-    return tasks
+    return [task_from_row(r) for r in rows]
 
 def complete_task(task_id, user_id):
     conn = get_connection()

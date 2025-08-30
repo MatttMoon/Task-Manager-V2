@@ -118,20 +118,19 @@ def _user_cfg(window):
 def populate_calendar_day_list(window):
     window.cal_tasks_list.clear()
     qd = window.calendar.selectedDate()
-    py_day = date(qd.year(), qd.month(), qd.day())
+    day_iso = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
 
-    # tasks for the selected day
-    tasks_today = [t for t in _load_tasks(window) if t.due_date == py_day]
+    tasks_on_day = [t for t in db.get_tasks(window.user[0]) if t.due_date and t.due_date.isoformat() == day_iso]
 
-    if not tasks_today:
+    if not tasks_on_day:
         window.cal_tasks_list.addItem("No tasks due.")
         return
 
     ucfg = _user_cfg(window)
-    tgroups = (ucfg.get("task_groups") or {}) if isinstance(ucfg, dict) else {}
-    pris    = (ucfg.get("priorities")  or {}) if isinstance(ucfg, dict) else {}
+    tgroups = ucfg.get("task_groups", {}) or {}
+    pris = ucfg.get("priorities", {}) or {}
 
-    for t in tasks_today:
+    for t in tasks_on_day:
         group = tgroups.get(str(t.id), "")
         group_badge = f"[{group}] " if group else ""
 
